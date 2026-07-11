@@ -1,11 +1,11 @@
-# Surfaced — Project Memory
+# Quixly — Project Memory
 
 Autonomous agent that gets Shopify merchants' products recommended by AI shopping
 engines (ChatGPT, Google AI Mode, Perplexity, Copilot, Gemini), then verifies the
 uplift. Full spec: see `PRD.md` (read it before large changes).
 
 ## Architecture at a glance
-- `app/` — TypeScript, **Shopify Remix app template**. Handles OAuth, session storage,
+- `app/` — TypeScript, **Shopify React Router app template**. Handles OAuth, session storage,
   billing, webhooks, App Bridge + Polaris embedded UI. Thin Shopify-facing shell only.
 - `agent/` — Python, **FastAPI + LangGraph**. The brain: engine querying, shopping-agent
   simulation, diagnosis, grounded optimization, publishing, verification. Async workers here.
@@ -25,7 +25,7 @@ uplift. Full spec: see `PRD.md` (read it before large changes).
   or Shopify Admin API writes. Show the plan; wait for approval before editing.
 - Prefer existing service wrappers before adding new abstractions.
 - Python: typed (pydantic) everywhere, structured LLM outputs, no bare LLM calls in routes.
-- TS: keep the Remix app thin — business/agent logic belongs in `agent/`, not `app/`.
+- TS: keep the React Router app thin — business/agent logic belongs in `agent/`, not `app/`.
 
 ## Risk zones (extra care — explain before touching)
 - **Never publish to a merchant's Shopify store without an explicit approval gate.**
@@ -48,3 +48,8 @@ uplift. Full spec: see `PRD.md` (read it before large changes).
 - Monorepo; keep `app/` and `agent/` independently runnable.
 - Agent graph nodes live in `agent/app/graph/` — one file per node.
 - Do not put running task lists or plans in this file (they go stale) — those live in the PR/issue.
+
+## Git
+- **Never add AI attribution to commits or PRs.** No `Co-Authored-By: Claude`/AI trailers, no
+  "Generated with Claude Code" lines, no AI mentions in commit messages or PR bodies. Write
+  commit messages as the human author, plainly describing the change.

@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  app:
+    name: app (lint + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.19"
+      # The Shopify template intentionally ships no committed lockfile, so use
+      # `npm install` (not `npm ci`).
+      - run: npm install
+      - run: npx prisma generate
+      - run: npm run lint
+      - run: npm run build
+
+  agent:
+    name: agent (lint + boot check)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      - run: uv run ruff check .
+      # pytest boots the FastAPI app via TestClient and hits /health — our boot check.
+      - run: uv run pytest

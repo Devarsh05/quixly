@@ -1,4 +1,4 @@
-# Surfaced — Product Requirements Document
+# Quixly — Product Requirements Document
 
 **Version:** 0.1 (build kickoff)
 **Owner:** Devarsh
@@ -84,7 +84,7 @@ Nodes:
 
 **Two services, one repo (monorepo):**
 
-- **App shell — `app/` (TypeScript, Shopify Remix app template):** OAuth, session storage, billing, webhooks, App Bridge + Polaris embedded UI. Use the official template because it removes the most error-prone Shopify plumbing. This is the thin Shopify-facing layer.
+- **App shell — `app/` (TypeScript, Shopify React Router app template):** OAuth, session storage, billing, webhooks, App Bridge + Polaris embedded UI. Use the official template because it removes the most error-prone Shopify plumbing. This is the thin Shopify-facing layer. (Shopify's official template migrated from Remix to React Router 7; `@shopify/shopify-app-react-router`.)
 - **Agent service — `agent/` (Python, FastAPI + LangGraph):** the brain — engine querying, simulation, diagnosis, optimization, verification, workers. This is where the IP lives and where your strengths are.
 
 **Shared infra**
@@ -165,7 +165,7 @@ Shopify App Store subscription. Free audit as the hook.
 
 ## 15. Build phases (expand each into tasks via plan mode)
 
-- **Phase 0 — Scaffold:** monorepo, CLAUDE.md, Shopify Remix app (via Shopify CLI), FastAPI agent service, Postgres/Redis, docker-compose, Railway deploy, dev store.
+- **Phase 0 — Scaffold:** monorepo, CLAUDE.md, Shopify React Router app (official template), FastAPI agent service, Postgres/Redis, docker-compose, Railway deploy, dev store.
 - **Phase 1 — Connect:** Shopify OAuth, embedded app loads in dev store, catalog ingestion → `products`.
 - **Phase 2 — Audit (first demoable value):** query panel + EngineRunner (Perplexity/OpenAI/Gemini) + Extractor + ShareOfModel + read-only report UI. *This is the free-audit hook.*
 - **Phase 3 — Fix:** product audit + grounded Optimizer (description + JSON-LD + metafields/GTIN) + preview/approve UI + Publisher (Admin API).
