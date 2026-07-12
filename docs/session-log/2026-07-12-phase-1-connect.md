@@ -40,6 +40,39 @@ Also split token errors into **permanent** (`TokenUnavailableError`, only on a 4
 `reauth_required`) vs **transient** (`TokenFetchError` → retried). Without this, one blip from the
 app shell would permanently brand a healthy shop as needing re-auth.
 
+#### 1b. Follow-up: the dead-refresh-chain path was silently transient (fixed)
+
+Review caught that the above was only half-right. The route classified a failed *refresh* as
+transient, so the 90-day-idle case would retry forever and never reach `reauth_required`.
+
+Root cause, in the library source: `unauthenticated.admin()` refreshes via
+`helpers/refresh-token.js`, which rethrows **only** `InvalidJwtError` and
+`HttpResponseError(400, "invalid_subject_token")`. Everything else — including a 400
+`invalid_grant`, the OAuth-standard response for an expired/rotated refresh token — is flattened
+into an anonymous `throw new Response(500)`. A dead chain was therefore indistinguishable from a
+network blip, and mapped to 502 → `TokenFetchError` → retried forever.
+
+Fix: `app/lib/admin-token.server.ts` now performs the refresh itself via `api.auth.refreshToken`
+so the real OAuth error survives, and classifies it. The refresh request and session creation stay
+library-owned; only the classification is ours. `shopifyApp()` does not expose its internal `api`,
+so `shopify.server.ts` exports one built from the same env constants (`@shopify/shopify-api`
+promoted from a transitive to an explicit dependency). This is not a second refresh authority —
+same process, still the only place a refresh happens.
+
+Both permanent cases now return the **same 404**:
+- no session row, and
+- dead refresh chain — `invalid_grant` / `invalid_subject_token` / `invalid_token` /
+  `invalid_client` / `unauthorized_client` / `InvalidJwtError`, plus a cheap pre-check on
+  `session.refreshTokenExpires` that catches the 90-day case without even calling Shopify.
+
+Transient failures (5xx, network) still return 502.
+
+**A mock hid a real bug here, twice over.** The first version of this fix called `shopify.api`,
+which does not exist at runtime — `shopifyApp()`'s returned object has no `api` key. The vitest
+suite passed anyway, because it mocked `../app/shopify.server`. It was caught by typecheck and
+then by a no-mock runtime smoke test importing the real modules. Lesson recorded: for anything
+touching the library's surface, assert against the real module, not the mock.
+
 ### 2. Prisma and Alembic share a database, fenced by schema
 
 `schema.prisma` hardcoded `url = "file:dev.sqlite"` — it never read `DATABASE_URL` at all.

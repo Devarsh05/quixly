@@ -4,15 +4,18 @@ A failed ingest must leave the products it already wrote plus a cursor to resume
 never an empty table, and never a duplicated catalog on retry.
 """
 
+import httpx
 import pytest
+import respx
 from sqlalchemy import func, select
 
 from app.jobs import ingest_catalog as job_module
 from app.jobs.ingest_catalog import ingest_catalog
 from app.models import IngestRun, IngestStatus, Product, Shop, ShopStatus
-from app.services.token_provider import TokenFetchError, TokenUnavailableError
+from app.services.token_provider import TokenFetchError, TokenProvider, TokenUnavailableError
 
 SHOP = "ingest-test.myshopify.com"
+TOKEN_URL = f"http://app-shell.test/internal/shops/{SHOP}/admin-token"
 
 
 def _product(pid: int, title: str, barcode: str | None = None) -> dict:
@@ -234,3 +237,55 @@ async def test_transient_token_error_does_not_flag_reauth(db, shop, run, patched
     await db.refresh(shop)
     assert run.status == IngestStatus.failed
     assert shop.status == ShopStatus.active, "a transient blip must not force re-auth"
+
+
+# --- The dead-refresh-chain path, end to end -------------------------------------------
+# These two run the REAL TokenProvider and REAL ShopifyAdminClient (patched_job's `install`
+# is deliberately not called), with only the app shell's HTTP response faked. They pin the
+# whole chain, because every link in it has to agree on what "permanent" means:
+#
+#   Shopify rejects the refresh token (invalid_grant)
+#     -> app shell returns 404
+#     -> TokenProvider raises TokenUnavailableError (not TokenFetchError)
+#     -> ingest job sets shops.status = reauth_required
+#
+# If any link mapped invalid_grant to "transient", a 90-day-idle shop would be retried
+# forever and never surfaced to the merchant.
+
+
+@respx.mock
+async def test_dead_refresh_chain_lands_the_shop_in_reauth_required(db, shop, run, patched_job):
+    """404 from the app shell (its response to invalid_grant) => reauth_required."""
+    token_route = respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(
+            404, json={"error": "Re-auth required", "reauth_required": True}
+        )
+    )
+
+    # Permanent: swallowed rather than re-raised, because no retry can fix it.
+    await ingest_catalog({"token_provider": TokenProvider()}, SHOP, run.id)
+
+    assert token_route.called
+
+    await db.refresh(run)
+    await db.refresh(shop)
+
+    assert shop.status == ShopStatus.reauth_required
+    assert run.status == IngestStatus.failed
+    assert run.products_written == 0
+    assert run.error
+
+
+@respx.mock
+async def test_app_shell_502_leaves_the_shop_active(db, shop, run, patched_job):
+    """The mirror image: a transient 502 must NOT reach reauth_required."""
+    respx.post(TOKEN_URL).mock(return_value=httpx.Response(502))
+
+    with pytest.raises(TokenFetchError):
+        await ingest_catalog({"token_provider": TokenProvider()}, SHOP, run.id)
+
+    await db.refresh(run)
+    await db.refresh(shop)
+
+    assert run.status == IngestStatus.failed
+    assert shop.status == ShopStatus.active, "a transient 502 must never force re-auth"

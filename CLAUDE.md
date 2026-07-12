@@ -63,6 +63,15 @@ invalidates its refresh token immediately**, so there can be exactly ONE refresh
 - **All agent-side Admin API calls go through `TokenProvider`** (`agent/app/services/`).
   A second token path would be a second refresh authority and would silently break the
   first. Never fetch or cache a token anywhere else.
+- **`/internal/shops/:shop/admin-token` status codes are load-bearing.** The agent decides
+  permanence from them, so they must not be loosened:
+  - **404 = PERMANENT** → agent flags `reauth_required` and stops. Covers *both* "no session
+    row" *and* a dead refresh chain (`invalid_grant` / expired `refreshTokenExpires`).
+  - **502 = TRANSIENT** → agent retries. Shopify 5xx, network, throttling.
+  Mapping a dead chain to 502 would retry a 90-day-idle shop forever and never surface it.
+  Note `unauthenticated.admin()` cannot make this distinction — it flattens every OAuth
+  error except `invalid_subject_token` into an anonymous 500 — which is why
+  `app/lib/admin-token.server.ts` performs the refresh itself via `api.auth.refreshToken`.
 - Jobs fetch tokens at the *start of the task*, never at enqueue time — a queued job can
   outlive a 60-minute token.
 - Refresh tokens die after **90 days of disuse**. Weekly scans keep the chain warm; a shop
