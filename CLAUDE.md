@@ -20,6 +20,10 @@ uplift. Full spec: see `PRD.md` (read it before large changes).
 - Tests: app `npm test` (vitest); agent `pytest` (needs Postgres up)
 - Worker (agent): `arq app.worker.WorkerSettings`
 - DB migrations: agent `alembic upgrade head`; app `npx prisma migrate dev` (Session only)
+- **Alembic drift check** (run after ANY schema change, either side):
+  `cd agent && uv run alembic revision --autogenerate -m "drift"` must produce an **EMPTY**
+  diff while `shopify.Session` exists. If it emits a `DROP`, the schema fence is broken —
+  fix it and delete the generated file. Never commit the drift-check migration.
 - Note: `npm run typecheck` reports two pre-existing `s-app-nav` errors from the upstream
   template. Not ours; not yet fixed. CI runs lint/test/build, not typecheck.
 
@@ -44,25 +48,40 @@ touch the other's** — they have independent, mutually-destructive drift detect
   Without those guards each tool sees the other's tables as drift and emits `DROP`s.
 - **Never add a model to `app/prisma/schema.prisma`.** New tables are Alembic migrations
   in `agent/`. Prisma exists only because the Shopify session-storage adapter needs it.
-- After changing either schema, run `alembic revision --autogenerate` and confirm the diff
+- **Do NOT set `version_table_schema` in `agent/alembic/env.py`.** Pinning it makes Alembic
+  compare its own bookkeeping table against the reflected table's `None` schema, its
+  self-exclusion misses, and autogenerate emits `DROP TABLE alembic_version` — destroying
+  the migration history. `alembic_version` is excluded **by name** in `include_object`
+  instead. (Observed, not hypothetical.)
+- After changing either schema, run the **drift check** (see Commands) and confirm the diff
   is **empty**. A non-empty diff means a guard is broken.
 - `prisma migrate dev` is **LOCAL ONLY** — it can reset the database. Deployed
   environments run `prisma migrate deploy`.
 - Same DB, two URL grammars: app uses `postgresql://`, agent uses `postgresql+asyncpg://`.
 
-## Shopify token custody (the app shell is the single refresh authority)
+## Shopify token custody (single refresh authority, serialized per shop)
 Offline access tokens expire (~60 min). Minting a new one **retires the previous token and
-invalidates its refresh token immediately**, so there can be exactly ONE refresher.
+invalidates its refresh token immediately** — so two rotations racing don't lose an update,
+they **break the chain and force the merchant to reinstall**.
 
-- The **app shell** is it: `unauthenticated.admin(shop)` refreshes within 5 minutes of
-  expiry and persists the rotation. Do not disable
-  `future.expiringOfflineAccessTokens` — public apps created after 2026-04-01 must use it.
-- The **agent stores no Shopify credential.** No access token, no refresh token, no
-  `shops.access_token_ref` column (PRD §8 is superseded on this point). It pulls
-  short-lived tokens from `POST /internal/shops/:shop/admin-token` on the app shell.
+- **`app/lib/admin-token.server.ts` is the SINGLE refresh authority.** It performs the
+  refresh itself and is the only sanctioned way to obtain an admin token.
+- **Refresh is serialized per shop** by a Postgres advisory lock (`lib/shop-lock.server.ts`),
+  and session state is re-read *after* acquiring it. Advisory, not in-process: the app shell
+  runs as multiple processes. **Adding a second refresh path anywhere — a webhook, a job, a
+  route — races and invalidates the chain.**
+- `authenticate.webhook()` **is** such a path (it refreshes via `ensureValidOfflineSession`),
+  so webhook routes authenticate through `lib/webhook-auth.server.ts`, under the same lock.
+  `unauthenticated.admin/storefront` also refresh and are deliberately **not re-exported**
+  from `shopify.server.ts`. Known residual: `authenticate.admin()` rotates by *token
+  exchange* and is outside the lock — merchant-present only; do not add more.
+- Do not disable `future.expiringOfflineAccessTokens` — public apps created after
+  2026-04-01 must use it.
+- The **agent stores no Shopify token or refresh token.** Ever. No `shops.access_token_ref`
+  column (PRD §8 is superseded on this point). It pulls short-lived tokens from
+  `POST /internal/shops/:shop/admin-token`.
 - **All agent-side Admin API calls go through `TokenProvider`** (`agent/app/services/`).
-  A second token path would be a second refresh authority and would silently break the
-  first. Never fetch or cache a token anywhere else.
+  Never fetch or cache a token anywhere else.
 - **`/internal/shops/:shop/admin-token` status codes are load-bearing.** The agent decides
   permanence from them, so they must not be loosened:
   - **404 = PERMANENT** → agent flags `reauth_required` and stops. Covers *both* "no session
@@ -83,6 +102,18 @@ invalidates its refresh token immediately**, so there can be exactly ONE refresh
   Publishing flows through `fixes.status = approved` only.
 - **Never fabricate product attributes, specs, GTINs, or reviews.** Optimizer may only
   enrich/restructure from verified source data; every fix carries a before/after diff + source.
+- **Schema ownership.** `shopify` schema = Prisma (`Session` + `_prisma_migrations`).
+  `public` = Alembic (everything else). **Neither tool may touch the other's.** Do NOT set
+  `version_table_schema` in Alembic's `env.py` — it disables Alembic's self-exclusion and
+  makes autogenerate emit `DROP TABLE alembic_version`; the table is excluded by name
+  instead. Full detail in "Schema ownership" above.
+- **Token authority.** The agent **NEVER** stores a Shopify token or refresh token.
+  `app/lib/admin-token.server.ts` is the SINGLE refresh authority, and refresh is serialized
+  per shop with a Postgres advisory lock. Adding a second refresh path anywhere (webhooks,
+  jobs, routes) races and invalidates the chain. Permanent failures (no session row, dead
+  refresh chain) → **404 → `reauth_required`**. Transient (5xx/network) → **502 → retry**.
+  **Never conflate the two** — conflating them retries a dead shop forever, or brands a
+  healthy one. Full detail in "Shopify token custody" above.
 - Do not edit OAuth, session storage, billing, or webhook-verification code without first
   explaining the risk.
 - Secrets: never hardcode or print API keys / Shopify tokens. Use env vars; keep local
@@ -94,6 +125,12 @@ invalidates its refresh token immediately**, so there can be exactly ONE refresh
 
 ## Verification
 - After DB or route changes: run the relevant tests and `npm run build` / `uvicorn` boot check.
+- **Mocks hide missing properties.** Any module touching `@shopify/shopify-api` needs a
+  **no-mock smoke test that imports the real module** and asserts the properties it uses
+  actually exist. A mocked `shopify.server` once let 17 tests pass green against
+  `shopify.api`, a property that does not exist and would have been `undefined` in
+  production. Green tests over a mock are not evidence.
+- After a schema change (either side): run the Alembic drift check (see Commands).
 - After any Optimizer change: run the grounding test suite (asserts no attribute is emitted
   that isn't present in source fixtures).
 - After a Publisher change: run against the dev store only; re-read the published page and
@@ -102,6 +139,8 @@ invalidates its refresh token immediately**, so there can be exactly ONE refresh
 ## Conventions
 - Monorepo; keep `app/` and `agent/` independently runnable.
 - Agent graph nodes live in `agent/app/graph/` — one file per node.
+- **`prisma migrate dev` is LOCAL ONLY** — it can reset the database. Deployed environments
+  use `prisma migrate deploy` (this is what CI runs).
 - Do not put running task lists or plans in this file (they go stale) — those live in the PR/issue.
 
 ## Git
