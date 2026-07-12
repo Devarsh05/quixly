@@ -1,10 +1,11 @@
 import type { ActionFunctionArgs } from "react-router";
-import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import { forwardWebhook } from "../lib/agent.server";
+import { authenticateWebhookSerialized } from "../lib/webhook-auth.server";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { shop, session, topic } = await authenticate.webhook(request);
+  // Serialized: webhook auth can itself rotate the offline token — see webhook-auth.server.
+  const { shop, session, topic } = await authenticateWebhookSerialized(request);
 
   console.log(`Received ${topic} webhook for ${shop}`);
 

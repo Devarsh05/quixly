@@ -87,7 +87,10 @@ export default shopify;
 export const apiVersion = ApiVersion.October25;
 export const addDocumentResponseHeaders = shopify.addDocumentResponseHeaders;
 export const authenticate = shopify.authenticate;
-export const unauthenticated = shopify.unauthenticated;
+// `unauthenticated` is deliberately NOT re-exported. Both `unauthenticated.admin()` and
+// `unauthenticated.storefront()` refresh the offline token outside our per-shop rotation
+// lock, which would race the token route and invalidate the refresh chain. Use
+// `getAdminToken()` (lib/admin-token.server.ts) instead — it is the serialized path.
 export const login = shopify.login;
 export const registerWebhooks = shopify.registerWebhooks;
 export const sessionStorage = shopify.sessionStorage;

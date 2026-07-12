@@ -12,6 +12,27 @@ jobs:
     defaults:
       run:
         working-directory: app
+
+    # The token-rotation tests exercise a REAL Postgres advisory lock — a mocked lock
+    # would prove nothing about serialization, which is the whole point of those tests.
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: quixly
+          POSTGRES_PASSWORD: quixly
+          POSTGRES_DB: quixly
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U quixly -d quixly"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://quixly:quixly@localhost:5432/quixly?schema=shopify
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,6 +42,8 @@ jobs:
       # `npm install` (not `npm ci`).
       - run: npm install
       - run: npx prisma generate
+      # `migrate deploy`, never `migrate dev` — dev can reset the database.
+      - run: npx prisma migrate deploy
       - run: npm run lint
       - run: npm test
       - run: npm run build

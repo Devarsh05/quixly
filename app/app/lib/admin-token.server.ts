@@ -17,8 +17,10 @@
  * refresh happens.
  */
 
+import type { Session } from "@shopify/shopify-api";
 import { HttpResponseError, InvalidJwtError } from "@shopify/shopify-api";
 
+import { withShopRefreshLock } from "./shop-lock.server";
 import { api, sessionStorage } from "../shopify.server";
 
 /** Mirrors the library's own refresh window (helpers/ensure-offline-token-is-not-expired.js). */
@@ -60,6 +62,13 @@ function isPermanentGrantFailure(error: unknown): boolean {
   return false;
 }
 
+function tokenOf(session: Session): AdminToken {
+  return {
+    accessToken: session.accessToken!,
+    expiresAt: session.expires ?? null,
+  };
+}
+
 /**
  * Returns a valid admin token for `shop`, refreshing it if it is near expiry.
  *
@@ -74,11 +83,30 @@ export async function getAdminToken(shop: string): Promise<AdminToken> {
     throw new ReauthRequiredError(`No session stored for ${shop}`);
   }
 
+  // Fast path: still valid, no rotation needed, so don't pay for the lock.
   if (!session.isExpired(WITHIN_MILLISECONDS_OF_EXPIRY)) {
-    return {
-      accessToken: session.accessToken!,
-      expiresAt: session.expires ?? null,
-    };
+    return tokenOf(session);
+  }
+
+  // Rotation must be serialized per shop: two concurrent refreshes would invalidate each
+  // other's refresh token and permanently break the chain. Callers block here rather than
+  // racing. See shop-lock.server.ts.
+  return withShopRefreshLock(shop, () => refreshUnderLock(shop, sessionId));
+}
+
+/** Must only be called while holding the shop's rotation lock. */
+async function refreshUnderLock(shop: string, sessionId: string): Promise<AdminToken> {
+  // Re-read AFTER acquiring the lock. Whoever held it before us may have just rotated the
+  // token, in which case there is nothing to do — this is what collapses N concurrent
+  // callers into exactly one Shopify refresh.
+  const session = await sessionStorage.loadSession(sessionId);
+
+  if (!session) {
+    throw new ReauthRequiredError(`No session stored for ${shop}`);
+  }
+
+  if (!session.isExpired(WITHIN_MILLISECONDS_OF_EXPIRY)) {
+    return tokenOf(session);
   }
 
   if (!session.refreshToken) {
@@ -107,12 +135,9 @@ export async function getAdminToken(shop: string): Promise<AdminToken> {
     throw error;
   }
 
-  // Persist the rotation immediately: the old token dies the instant this one is issued,
-  // so losing this write would strand the shop.
+  // Persist the rotation before releasing the lock. The old token — and its refresh token —
+  // died the instant this one was issued, so losing this write would strand the shop.
   await sessionStorage.storeSession(refreshed);
 
-  return {
-    accessToken: refreshed.accessToken!,
-    expiresAt: refreshed.expires ?? null,
-  };
+  return tokenOf(refreshed);
 }

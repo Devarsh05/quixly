@@ -1,11 +1,12 @@
 import type { ActionFunctionArgs } from "react-router";
 
 import { forwardWebhook } from "../lib/agent.server";
-import { authenticate } from "../shopify.server";
+import { authenticateWebhookSerialized } from "../lib/webhook-auth.server";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   // Verifies the HMAC. Anything past this line is provably from Shopify.
-  const { shop, topic, payload } = await authenticate.webhook(request);
+  // Serialized: webhook auth can itself rotate the offline token — see webhook-auth.server.
+  const { shop, topic, payload } = await authenticateWebhookSerialized(request);
 
   // Shopify expects a fast 200, so this hands off to the agent and does nothing else —
   // all catalog logic lives in agent/.
