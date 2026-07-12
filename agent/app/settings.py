@@ -6,7 +6,7 @@ All configuration comes from the environment / a local ``.env`` file (see
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,6 +24,15 @@ class Settings(BaseSettings):
     # Infrastructure
     database_url: str = "postgresql+asyncpg://quixly:quixly@localhost:5432/quixly"
     redis_url: str = "redis://localhost:6379/0"
+
+    # Internal app-shell <-> agent API. The app shell is the single refresh authority
+    # for Shopify offline tokens; the agent calls back to it for short-lived tokens.
+    # SecretStr so the key can never surface in a repr, log line, or traceback.
+    internal_api_key: SecretStr = Field(default=SecretStr(""))
+    app_shell_url: str = "http://localhost:3000"
+
+    # Shopify Admin API version — must match `api_version` in app/shopify.app.toml.
+    shopify_api_version: str = "2025-10"
 
     # AI shopping-engine API keys (optional until Phase 2 wiring; no secret defaults)
     perplexity_api_key: str | None = Field(default=None)
