@@ -1,41 +1,28 @@
-# This file stores configurations for your Shopify app.
-client_id = ""
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "8ad730c2c915afc9e7dcae3ee071f7e0"
+name = "quixly"
+application_url = "https://shopify.dev/apps/default-app-home"
+embedded = true
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products"
+scopes = ""
 
 [webhooks]
-api_version = "2025-10"
+api_version = "2026-10"
 
-  # Handled by: /app/routes/webhooks.app.uninstalled.tsx
   [[webhooks.subscriptions]]
   uri = "/webhooks/app/uninstalled"
-  topics = ["app/uninstalled"]
+  topics = [ "app/uninstalled" ]
 
-  # Handled by: /app/routes/webhooks.app.scopes_update.tsx
   [[webhooks.subscriptions]]
-  topics = [ "app/scopes_update" ]
   uri = "/webhooks/app/scopes_update"
+  topics = [ "app/scopes_update" ]
 
-  # Handled by: /app/routes/webhooks.products.update.tsx
-  # Keeps `products` in the agent's Postgres in step with the merchant's catalog.
-  # Intentionally unfiltered: our audit covers the whole catalog, so we cannot ignore
-  # cheap products the way the template's price-filter example does.
   [[webhooks.subscriptions]]
-  topics = ["products/update"]
   uri = "/webhooks/products/update"
+  topics = [ "products/update" ]
 
-  # Mandatory compliance topic for public apps only
-  # See: https://shopify.dev/docs/apps/build/privacy-law-compliance
-  # [[webhooks.subscriptions]]
-  # uri = "/webhooks/customers/data_request"
-  # compliance_topics = ["customers/data_request"]
-
-  # [[webhooks.subscriptions]]
-  # uri = "/webhooks/customers/redact"
-  # compliance_topics = ["customers/redact"]
-
-  # [[webhooks.subscriptions]]
-  # uri = "/webhooks/shop/redact"
-  # compliance_topics = ["shop/redact"]
+[auth]
+redirect_urls = [ "https://shopify.dev/apps/default-app-home/api/auth" ]
