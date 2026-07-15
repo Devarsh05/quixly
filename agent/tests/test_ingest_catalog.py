@@ -18,12 +18,15 @@ SHOP = "ingest-test.myshopify.com"
 TOKEN_URL = f"http://app-shell.test/internal/shops/{SHOP}/admin-token"
 
 
-def _product(pid: int, title: str, barcode: str | None = None) -> dict:
+def _product(
+    pid: int, title: str, barcode: str | None = None, status: str = "ACTIVE"
+) -> dict:
+    # `status` mirrors Shopify's GraphQL ProductStatus enum, which is uppercase.
     return {
         "id": f"gid://shopify/Product/{pid}",
         "title": title,
         "descriptionHtml": f"<p>{title}</p>",
-        "status": "ACTIVE",
+        "status": status,
         "variants": {"nodes": [{"id": f"gid://shopify/Variant/{pid}", "barcode": barcode}]},
         "metafields": {"nodes": []},
     }
@@ -121,6 +124,41 @@ async def test_writes_products_and_completes(db, shop, run, patched_job):
     ).scalar_one()
     assert coffee.gtin == "0123456789012"
     assert coffee.title == "Coffee"
+    # Shopify's uppercase ACTIVE is normalized to the lowercase canonical.
+    assert coffee.visibility_state == "active"
+
+
+async def test_product_status_is_normalized_to_lowercase(db, shop, run, patched_job):
+    """Shopify's uppercase ProductStatus enum is stored as the lowercase canonical."""
+    patched_job(
+        FakeAdminClient(
+            [
+                (
+                    [
+                        _product(1, "Live", status="ACTIVE"),
+                        _product(2, "Unpublished", status="DRAFT"),
+                        _product(3, "Retired", status="ARCHIVED"),
+                    ],
+                    "cursor-1",
+                )
+            ]
+        )
+    )
+
+    await ingest_catalog({"token_provider": object()}, SHOP, run.id)
+
+    states = dict(
+        (
+            await db.execute(
+                select(Product.shopify_product_id, Product.visibility_state).where(
+                    Product.shop_id == shop.id
+                )
+            )
+        ).all()
+    )
+    assert states["gid://shopify/Product/1"] == "active"
+    assert states["gid://shopify/Product/2"] == "draft"
+    assert states["gid://shopify/Product/3"] == "archived"
 
 
 async def test_rerunning_upserts_rather_than_duplicating(db, shop, run, patched_job):

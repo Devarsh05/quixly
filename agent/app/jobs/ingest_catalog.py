@@ -29,6 +29,22 @@ from app.services.token_provider import TokenProvider, TokenUnavailableError
 
 logger = logging.getLogger(__name__)
 
+# Shopify's GraphQL ProductStatus enum is uppercase (ACTIVE/DRAFT/ARCHIVED); the rest of
+# the system stores a lowercase canonical (matching the webhook write path and the
+# shop_status enum). Map explicitly so an unrecognized value fails loudly rather than
+# leaking an un-normalized value through or silently nulling it.
+_STATUS = {"ACTIVE": "active", "DRAFT": "draft", "ARCHIVED": "archived"}
+
+
+def _visibility_state(node: dict[str, Any]) -> str:
+    raw = node.get("status")
+    try:
+        return _STATUS[raw]
+    except KeyError:
+        raise ValueError(
+            f"Unmapped Shopify product status {raw!r} for {node.get('id')}"
+        ) from None
+
 
 async def _write_page(session, shop_id: int, nodes: list[dict[str, Any]]) -> int:
     """Upsert one page of products. Returns the number of rows written."""
@@ -48,7 +64,7 @@ async def _write_page(session, shop_id: int, nodes: list[dict[str, Any]]) -> int
                 "variants_json": variants,
                 "gtin": extract_gtin(variants),
                 "metafields_json": metafields,
-                "visibility_state": node.get("status"),
+                "visibility_state": _visibility_state(node),
                 "updated_at": datetime.now(UTC),
             }
         )
