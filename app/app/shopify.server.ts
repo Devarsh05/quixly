@@ -20,7 +20,7 @@ const EXPIRING_OFFLINE_ACCESS_TOKENS = true;
 const shopify = shopifyApp({
   apiKey: API_KEY,
   apiSecretKey: API_SECRET,
-  apiVersion: ApiVersion.October25,
+  apiVersion: ApiVersion.July26,
   scopes: SCOPES,
   appUrl: APP_URL,
   authPathPrefix: "/auth",
@@ -77,14 +77,14 @@ const shopify = shopifyApp({
 export const api = shopifyApi({
   apiKey: API_KEY,
   apiSecretKey: API_SECRET,
-  apiVersion: ApiVersion.October25,
+  apiVersion: ApiVersion.July26,
   scopes: SCOPES,
   hostName: APP_URL.replace(/^https?:\/\//, ""),
   isEmbeddedApp: true,
 });
 
 export default shopify;
-export const apiVersion = ApiVersion.October25;
+export const apiVersion = ApiVersion.July26;
 export const addDocumentResponseHeaders = shopify.addDocumentResponseHeaders;
 export const authenticate = shopify.authenticate;
 // `unauthenticated` is deliberately NOT re-exported. Both `unauthenticated.admin()` and

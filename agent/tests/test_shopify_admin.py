@@ -11,7 +11,7 @@ from app.services.token_provider import TokenProvider
 
 SHOP = "quixly-dev.myshopify.com"
 TOKEN_URL = f"http://app-shell.test/internal/shops/{SHOP}/admin-token"
-GRAPHQL_URL = f"https://{SHOP}/admin/api/2025-10/graphql.json"
+GRAPHQL_URL = f"https://{SHOP}/admin/api/2026-07/graphql.json"
 
 OLD_TOKEN = "shpat_old"
 NEW_TOKEN = "shpat_new"

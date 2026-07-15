@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     app_shell_url: str = "http://localhost:3000"
 
     # Shopify Admin API version — must match `api_version` in app/shopify.app.toml.
-    shopify_api_version: str = "2025-10"
+    shopify_api_version: str = "2026-07"
 
     # AI shopping-engine API keys (optional until Phase 2 wiring; no secret defaults)
     perplexity_api_key: str | None = Field(default=None)
