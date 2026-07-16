@@ -24,8 +24,12 @@ uplift. Full spec: see `PRD.md` (read it before large changes).
   `cd agent && uv run alembic revision --autogenerate -m "drift"` must produce an **EMPTY**
   diff while `shopify.Session` exists. If it emits a `DROP`, the schema fence is broken —
   fix it and delete the generated file. Never commit the drift-check migration.
-- Note: `npm run typecheck` reports two pre-existing `s-app-nav` errors from the upstream
-  template. Not ours; not yet fixed. CI runs lint/test/build, not typecheck.
+- `npm run typecheck` (`react-router typegen && tsc --noEmit`) runs in the app CI job and must
+  be green. `<s-app-nav>` (App Bridge) is typed via an ambient `JSX.IntrinsicElements`
+  declaration in `app/app/app-bridge.d.ts` — `@shopify/polaris-types` covers the other `s-*`
+  elements but not this one. Our `ci.yml` never carried the upstream template's
+  `javascript`-branch typecheck skip; typecheck simply wasn't wired into CI until now.
+  (Observed, not hypothetical.)
 
 ## Working rules
 - **Plan first** for anything spanning multiple files, new agent nodes, DB schema changes,
