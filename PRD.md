@@ -96,13 +96,26 @@ Nodes:
 - **Deploy:** Railway (both services + Postgres + Redis); Vercel optional for a marketing site.
 
 **Interfaces**
-- App shell ↔ agent service over an internal authenticated API.
+- App shell ↔ agent service over an internal authenticated API (shared secret,
+  `INTERNAL_API_KEY`). **Bidirectional:** the app shell pushes events to the agent
+  (shop connected, webhooks), and the agent calls *back* to the app shell to obtain
+  short-lived Shopify admin tokens — the app shell is the single token-refresh authority.
 - Agent service exposes an **MCP server** (`scan_visibility`, `audit_product`, `propose_fix`, `publish_fix`, `verify_uplift`) so the loop is MCP-native and drivable by other agents.
 
 ## 8. Data model (core tables)
 
-- `shops(id, shop_domain, access_token_ref, plan, status, created_at)`
+- `shops(id, shop_domain, plan, status, created_at)`
+  *Revised in Phase 1: the original `access_token_ref` column is **removed**. Shopify offline
+  tokens now expire (~60 min), and minting a new one invalidates the previous token's refresh
+  token — so there can be exactly one refresh authority, and that is the app shell. The agent
+  stores no Shopify credential; it fetches short-lived tokens from the app shell on demand via
+  `TokenProvider`. `status`: `active|uninstalled|reauth_required`.*
 - `products(id, shop_id, shopify_product_id, title, body, variants_json, gtin, metafields_json, visibility_state, updated_at)`
+  *Note: GTIN/barcode is a **variant** field in Shopify. `products.gtin` is a convenience column
+  populated from the primary variant; every variant's barcode lives in `variants_json`.*
+- `ingest_runs(id, shop_id, status, products_seen, products_written, cursor, error, started_at, completed_at)`
+  *Added in Phase 1. Kept separate from `agent_runs`, which is shaped for LangGraph node
+  execution. `cursor` makes a failed catalog ingest resumable rather than restarting from zero.*
 - `competitors(id, shop_id, name, domain)`
 - `query_panels(id, shop_id, category, queries_json, created_at)`
 - `engine_runs(id, panel_id, engine, query, response_raw, cited_brands_json, cited_sources_json, our_mentions_json, ts)`
@@ -115,7 +128,10 @@ Nodes:
 
 ## 9. API sketch (agent service, FastAPI)
 
-- `POST /shops/{id}/connect` — ingest catalog
+- `POST /shops/connect` — register shop + enqueue catalog ingest (202 + `run_id`)
+  *Revised in Phase 1: was `POST /shops/{id}/connect`, which cannot work — at connect time no
+  internal shop id exists yet. Keyed on `shop_domain`, idempotent, and it carries no access
+  token. Companion: `GET /shops/{id}/ingest/{run_id}` for progress.*
 - `POST /shops/{id}/panels` — generate/define query panel for categories
 - `POST /shops/{id}/scan` — run panel → share-of-model + audits (async job → returns run_id)
 - `GET  /shops/{id}/report` — visibility score, competitor gaps, invisible products

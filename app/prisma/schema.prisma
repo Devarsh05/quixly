@@ -5,12 +5,12 @@ generator client {
   provider = "prisma-client-js"
 }
 
-// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
-// enough when changing adapters.
-// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
+// Prisma owns ONLY the Session table, and only inside the `shopify` Postgres schema
+// (set via `?schema=shopify` on DATABASE_URL). Every other table is owned by Alembic
+// in the `public` schema. Never add a model here — see CLAUDE.md, "Schema ownership".
 datasource db {
-  provider = "sqlite"
-  url      = "file:dev.sqlite"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 model Session {

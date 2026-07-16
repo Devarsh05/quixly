@@ -13,15 +13,19 @@ dependencies = [
     "alembic>=1.14",
     "asyncpg>=0.30",
     "psycopg[binary]>=3.2",
+    "greenlet>=3.1",
     "redis>=5.2",
     "arq>=0.26",
+    "httpx>=0.28",
 ]
 
 [dependency-groups]
 dev = [
     "ruff>=0.8",
     "pytest>=8.3",
-    "httpx>=0.28",
+    "pytest-asyncio>=0.24",
+    "respx>=0.22",
+    "fakeredis>=2.36.2",
 ]
 
 [build-system]
@@ -34,9 +38,13 @@ packages = ["app"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Alembic writes migrations from its own template (long lines, `Union[...]`). They are
+# generated artifacts, not hand-written code — don't hold them to our style.
+extend-exclude = ["alembic/versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+asyncio_mode = "auto"

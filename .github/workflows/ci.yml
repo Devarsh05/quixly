@@ -7,11 +7,32 @@ on:
 
 jobs:
   app:
-    name: app (lint + build)
+    name: app (lint + test + build)
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: app
+
+    # The token-rotation tests exercise a REAL Postgres advisory lock — a mocked lock
+    # would prove nothing about serialization, which is the whole point of those tests.
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: quixly
+          POSTGRES_PASSWORD: quixly
+          POSTGRES_DB: quixly
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U quixly -d quixly"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://quixly:quixly@localhost:5432/quixly?schema=shopify
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,15 +42,50 @@ jobs:
       # `npm install` (not `npm ci`).
       - run: npm install
       - run: npx prisma generate
+      # `migrate deploy`, never `migrate dev` — dev can reset the database.
+      - run: npx prisma migrate deploy
       - run: npm run lint
+      - run: npm test
       - run: npm run build
 
   agent:
-    name: agent (lint + boot check)
+    name: agent (lint + tests)
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: agent
+
+    # The Phase 1 suite covers /shops/connect idempotency and catalog ingestion, which
+    # exercise real Postgres (upserts, savepoints). Token/auth tests fake Redis, but the
+    # services are here so anything DB- or queue-backed can run for real.
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: quixly
+          POSTGRES_PASSWORD: quixly
+          POSTGRES_DB: quixly
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U quixly -d quixly"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://quixly:quixly@localhost:5432/quixly
+      REDIS_URL: redis://localhost:6379/0
+
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -37,5 +93,6 @@ jobs:
           python-version: "3.12"
       - run: uv sync
       - run: uv run ruff check .
-      # pytest boots the FastAPI app via TestClient and hits /health — our boot check.
+      # Migrations must be applied before the DB-backed tests can run.
+      - run: uv run alembic upgrade head
       - run: uv run pytest
