@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import require_internal_api_key
 from app.db import get_db
 from app.models import Product, Shop, ShopStatus
-from app.services.catalog import extract_gtin
+from app.services.catalog import extract_gtin, normalize_visibility_state
 from app.services.token_provider import TokenProvider
 
 logger = logging.getLogger(__name__)
@@ -80,17 +80,29 @@ async def _handle_product_update(
     product_gid = f"gid://shopify/Product/{payload['id']}"
     variants = payload.get("variants") or []
 
+    values: dict[str, Any] = {
+        "title": payload.get("title"),
+        "body": payload.get("body_html"),
+        "variants_json": variants,
+        "gtin": extract_gtin(variants),
+        "updated_at": datetime.now(UTC),
+    }
+    # A raising webhook becomes a 500 back to the app shell -> Shopify retry storm and a lost
+    # update. On an unmapped status, keep the previously-stored visibility_state (omit it from
+    # the UPDATE) and apply the rest of the fields anyway. Ingest, by contrast, raises.
+    try:
+        values["visibility_state"] = normalize_visibility_state(payload.get("status"))
+    except ValueError:
+        logger.warning(
+            "products/update for %s carried unmapped status %r; leaving visibility_state unchanged",
+            product_gid,
+            payload.get("status"),
+        )
+
     result = await db.execute(
         update(Product)
         .where(Product.shop_id == shop.id, Product.shopify_product_id == product_gid)
-        .values(
-            title=payload.get("title"),
-            body=payload.get("body_html"),
-            variants_json=variants,
-            gtin=extract_gtin(variants),
-            visibility_state=payload.get("status"),
-            updated_at=datetime.now(UTC),
-        )
+        .values(**values)
     )
     await db.commit()
 

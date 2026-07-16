@@ -23,26 +23,20 @@ from sqlalchemy.dialects.postgresql import insert
 from app.db import SessionLocal
 from app.models import IngestRun, IngestStatus, Product, Shop, ShopStatus
 from app.redis import release_ingest_lock
-from app.services.catalog import extract_gtin
+from app.services.catalog import extract_gtin, normalize_visibility_state
 from app.services.shopify_admin import ShopifyAdminClient
 from app.services.token_provider import TokenProvider, TokenUnavailableError
 
 logger = logging.getLogger(__name__)
 
-# Shopify's GraphQL ProductStatus enum is uppercase (ACTIVE/DRAFT/ARCHIVED); the rest of
-# the system stores a lowercase canonical (matching the webhook write path and the
-# shop_status enum). Map explicitly so an unrecognized value fails loudly rather than
-# leaking an un-normalized value through or silently nulling it.
-_STATUS = {"ACTIVE": "active", "DRAFT": "draft", "ARCHIVED": "archived"}
-
-
 def _visibility_state(node: dict[str, Any]) -> str:
-    raw = node.get("status")
+    # Shared normalizer with the webhook write path (app.services.catalog); the wrapper
+    # exists only to name the offending product GID when one node in a large page fails.
     try:
-        return _STATUS[raw]
-    except KeyError:
+        return normalize_visibility_state(node.get("status"))
+    except ValueError:
         raise ValueError(
-            f"Unmapped Shopify product status {raw!r} for {node.get('id')}"
+            f"Unmapped Shopify product status {node.get('status')!r} for {node.get('id')}"
         ) from None
 
 

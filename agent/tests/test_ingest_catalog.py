@@ -138,6 +138,7 @@ async def test_product_status_is_normalized_to_lowercase(db, shop, run, patched_
                         _product(1, "Live", status="ACTIVE"),
                         _product(2, "Unpublished", status="DRAFT"),
                         _product(3, "Retired", status="ARCHIVED"),
+                        _product(4, "Direct link only", status="UNLISTED"),
                     ],
                     "cursor-1",
                 )
@@ -159,6 +160,22 @@ async def test_product_status_is_normalized_to_lowercase(db, shop, run, patched_
     assert states["gid://shopify/Product/1"] == "active"
     assert states["gid://shopify/Product/2"] == "draft"
     assert states["gid://shopify/Product/3"] == "archived"
+    # `unlisted` (reachable on Admin API 2026-07) is kept as its own state, not collapsed.
+    assert states["gid://shopify/Product/4"] == "unlisted"
+
+
+async def test_unmapped_status_fails_the_run(db, shop, run, patched_job):
+    """An unrecognized ProductStatus raises, failing the run rather than leaking a raw value."""
+    patched_job(
+        FakeAdminClient([([_product(1, "Mystery", status="SOMETHING_NEW")], "cursor-1")])
+    )
+
+    with pytest.raises(ValueError):
+        await ingest_catalog({"token_provider": object()}, SHOP, run.id)
+
+    await db.refresh(run)
+    assert run.status == IngestStatus.failed
+    assert run.error
 
 
 async def test_rerunning_upserts_rather_than_duplicating(db, shop, run, patched_job):
