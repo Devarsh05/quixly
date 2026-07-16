@@ -85,8 +85,11 @@ they **break the chain and force the merchant to reinstall**.
   `authenticate.webhook()` → `ensureValidOfflineSession` refreshes through the library's
   global-client storage, which can't be pinned to the tx. With a Prisma pool ≤ concurrent
   refreshes, the lock winner can't get the extra connection it needs and deadlocks. Fix
-  pending (see `docs/backlog.md` → Token custody). (Observed via the constrained-pool test, not
-  hypothetical.)
+  pending (see `docs/backlog.md` → Token custody). Not hypothetical: the admin-token path had
+  this exact deadlock (now fixed by tx-pinning), observed on CI where `admin-token-rotation.test.ts`
+  fires 10 concurrent refreshes against the runner's small default Prisma pool (`num_cpus*2+1`);
+  it masked on higher-core dev machines. There is no `connection_limit`-capped test, and the
+  webhook residual itself is not independently test-covered.
 - Do not disable `future.expiringOfflineAccessTokens` — public apps created after
   2026-04-01 must use it.
 - The **agent stores no Shopify token or refresh token.** Ever. No `shops.access_token_ref`
@@ -151,6 +154,13 @@ they **break the chain and force the merchant to reinstall**.
 ## Conventions
 - Monorepo; keep `app/` and `agent/` independently runnable.
 - Agent graph nodes live in `agent/app/graph/` — one file per node.
+- **`products.visibility_state` has ONE normalizer** — `normalize_visibility_state` in
+  `agent/app/services/catalog.py`, used by BOTH writers (the ingest job and the `products/update`
+  webhook). Case-insensitive (GraphQL yields UPPERCASE, webhooks lowercase); maps
+  `active/draft/archived/unlisted`, with `unlisted` a distinct value never collapsed to `active`.
+  Ingest raises on an unknown status; the webhook logs and keeps the prior value (a raising
+  webhook becomes a 500 → Shopify retry storm). Column stays `VARCHAR(32)` nullable, no enum/CHECK
+  — adding a status is code-only, no migration. Don't add a write path that bypasses the normalizer.
 - **`prisma migrate dev` is LOCAL ONLY** — it can reset the database. Deployed environments
   use `prisma migrate deploy` (this is what CI runs).
 - Do not put running task lists or plans in this file (they go stale) — those live in the PR/issue.
