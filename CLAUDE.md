@@ -75,6 +75,14 @@ they **break the chain and force the merchant to reinstall**.
   `unauthenticated.admin/storefront` also refresh and are deliberately **not re-exported**
   from `shopify.server.ts`. Known residual: `authenticate.admin()` rotates by *token
   exchange* and is outside the lock — merchant-present only; do not add more.
+- Known residual: the **webhook refresh path is pool-coupled and can deadlock** under
+  concurrent same-shop webhook refreshes. The lock holds one pooled connection for its whole
+  `$transaction`; the admin-token path runs its inner session I/O on *that* connection, but
+  `authenticate.webhook()` → `ensureValidOfflineSession` refreshes through the library's
+  global-client storage, which can't be pinned to the tx. With a Prisma pool ≤ concurrent
+  refreshes, the lock winner can't get the extra connection it needs and deadlocks. Fix
+  pending (see `docs/backlog.md` → Token custody). (Observed via the constrained-pool test, not
+  hypothetical.)
 - Do not disable `future.expiringOfflineAccessTokens` — public apps created after
   2026-04-01 must use it.
 - The **agent stores no Shopify token or refresh token.** Ever. No `shops.access_token_ref`

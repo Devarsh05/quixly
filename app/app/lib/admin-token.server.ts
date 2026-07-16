@@ -17,8 +17,10 @@
  * refresh happens.
  */
 
+import type { Prisma, PrismaClient } from "@prisma/client";
 import type { Session } from "@shopify/shopify-api";
 import { HttpResponseError, InvalidJwtError } from "@shopify/shopify-api";
+import { PrismaSessionStorage } from "@shopify/shopify-app-session-storage-prisma";
 
 import { withShopRefreshLock } from "./shop-lock.server";
 import { api, sessionStorage } from "../shopify.server";
@@ -91,15 +93,27 @@ export async function getAdminToken(shop: string): Promise<AdminToken> {
   // Rotation must be serialized per shop: two concurrent refreshes would invalidate each
   // other's refresh token and permanently break the chain. Callers block here rather than
   // racing. See shop-lock.server.ts.
-  return withShopRefreshLock(shop, () => refreshUnderLock(shop, sessionId));
+  return withShopRefreshLock(shop, (tx) => refreshUnderLock(tx, shop, sessionId));
 }
 
 /** Must only be called while holding the shop's rotation lock. */
-async function refreshUnderLock(shop: string, sessionId: string): Promise<AdminToken> {
+async function refreshUnderLock(
+  tx: Prisma.TransactionClient,
+  shop: string,
+  sessionId: string,
+): Promise<AdminToken> {
+  // Read and write through the lock's own transaction connection, never the global client.
+  // The advisory lock is held for the whole transaction; if the inner I/O borrowed a second
+  // pooled connection, N concurrent callers could exhaust the pool with lock-holders and
+  // deadlock the one that needs the extra connection. Cast: the adapter is generic over
+  // <T extends PrismaClient> and only touches `.session`, which TransactionClient has, but
+  // TransactionClient is not assignable to PrismaClient (it omits $transaction/$connect/…).
+  const txStorage = new PrismaSessionStorage(tx as unknown as PrismaClient);
+
   // Re-read AFTER acquiring the lock. Whoever held it before us may have just rotated the
   // token, in which case there is nothing to do — this is what collapses N concurrent
   // callers into exactly one Shopify refresh.
-  const session = await sessionStorage.loadSession(sessionId);
+  const session = await txStorage.loadSession(sessionId);
 
   if (!session) {
     throw new ReauthRequiredError(`No session stored for ${shop}`);
@@ -137,7 +151,7 @@ async function refreshUnderLock(shop: string, sessionId: string): Promise<AdminT
 
   // Persist the rotation before releasing the lock. The old token — and its refresh token —
   // died the instant this one was issued, so losing this write would strand the shop.
-  await sessionStorage.storeSession(refreshed);
+  await txStorage.storeSession(refreshed);
 
   return tokenOf(refreshed);
 }

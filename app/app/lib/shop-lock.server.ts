@@ -16,6 +16,8 @@
  * session AFTER acquiring it (another holder may have just rotated it).
  */
 
+import type { Prisma } from "@prisma/client";
+
 import prisma from "../db.server";
 
 /** Namespace so our keys cannot collide with any other advisory lock in this database. */
@@ -51,11 +53,14 @@ function shopLockKey(shop: string): bigint {
  * session. Re-read session state inside `fn` — whatever you loaded before calling this may
  * be stale by the time the lock is granted.
  */
-export async function withShopRefreshLock<T>(shop: string, fn: () => Promise<T>): Promise<T> {
+export async function withShopRefreshLock<T>(
+  shop: string,
+  fn: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T> {
   return prisma.$transaction(
     async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(${shopLockKey(shop)}::bigint)`;
-      return fn();
+      return fn(tx);
     },
     { timeout: LOCK_TIMEOUT_MS, maxWait: LOCK_MAX_WAIT_MS },
   );
