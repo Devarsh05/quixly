@@ -45,6 +45,7 @@ jobs:
       # `migrate deploy`, never `migrate dev` — dev can reset the database.
       - run: npx prisma migrate deploy
       - run: npm run lint
+      - run: npm run typecheck
       - run: npm test
       - run: npm run build
 
