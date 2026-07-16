@@ -44,3 +44,25 @@ the phase by which it should be revisited.
   tx-bound session storage into `authenticate.webhook()`. Deliberately left as a separate change
   — the admin-token fix was scoped to `admin-token.server.ts` and must not touch library-owned
   auth. _Raised: 2026-07-15 (admin-token tx-pinning fix)._
+
+## App shell / tooling
+
+- **`app/tsconfig.json` uses the deprecated `compilerOptions.baseUrl`.** Shipped by the Shopify
+  React Router template; `baseUrl` is deprecated ahead of TS 7. Not failing typecheck today, but
+  will need migrating (drop `baseUrl`; express any path mapping via `paths` alone) before a TS 7
+  bump. _Raised: 2026-07-16 (Phase 1 closeout)._
+
+## Webhooks / delivery
+
+- **End-to-end webhook HMAC delivery is unverified.** Shopify does not deliver live webhooks to a
+  `--use-localhost` app, so `authenticate.webhook` (HMAC verify) and the full `app/uninstalled`
+  chain (Shopify → app shell HMAC → forward → agent → `status = uninstalled`) have never run against
+  a live delivery. The agent-side handler is unit-tested; only live delivery is deferred. Exercise
+  behind a public tunnel. _Raised: 2026-07-16 (Phase 1 closeout)._
+
+## Compliance
+
+- **Mandatory compliance webhooks are still commented out.** `customers/data_request`,
+  `customers/redact`, and `shop/redact` are not yet subscribed in `app/shopify.app.toml`. Required
+  for App Store submission (Phase 5); implement and verify before submitting.
+  _Raised: 2026-07-16 (Phase 1 closeout, carried from the 2026-07-12 connect log)._
