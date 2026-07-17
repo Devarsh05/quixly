@@ -48,3 +48,6 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 asyncio_mode = "auto"
+markers = [
+    "live: hits a real external API; opt-in, skipped unless the relevant key is set (not run in CI)",
+]

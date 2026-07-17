@@ -34,10 +34,20 @@ class Settings(BaseSettings):
     # Shopify Admin API version — must match `api_version` in app/shopify.app.toml.
     shopify_api_version: str = "2026-07"
 
-    # AI shopping-engine API keys (optional until Phase 2 wiring; no secret defaults)
-    perplexity_api_key: str | None = Field(default=None)
+    # AI shopping-engine API keys (optional until Phase 2 wiring; no secret defaults).
+    # SecretStr so the key can never surface in a repr, log line, or traceback.
+    perplexity_api_key: SecretStr = Field(default=SecretStr(""))
     openai_api_key: str | None = Field(default=None)
     gemini_api_key: str | None = Field(default=None)
+
+    # EngineRunner / Perplexity Sonar knobs.
+    perplexity_model: str = "sonar"
+    # Pinned, not left to the engine default: share-of-model is a cross-period metric, so an
+    # unpinned temperature would make historical engine_runs non-comparable.
+    perplexity_temperature: float = 0.2
+    perplexity_timeout_seconds: float = 30.0
+    engine_max_concurrency: int = 5
+    engine_max_retries: int = 3
 
 
 @lru_cache
