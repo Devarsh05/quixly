@@ -24,6 +24,16 @@ the phase by which it should be revisited.
   `variants_json`, so this is a selection-rule change, not new data.
   _Raised: 2026-07-15 (Phase 1 closeout)._
 
+## Extractor
+
+- **`verbatim` returns the whole answer, not the brand's local snippet.** Live testing shows the
+  extractor model populates each `ExtractedBrand.verbatim` with the full answer text rather than
+  the local snippet the brand was pulled from. Harmless to grounding — `_is_grounded`
+  (`agent/app/graph/extractor.py`) matches on the brand **name**, not `verbatim` — but useless for
+  the position/context analysis `verbatim` is meant to feed. Tighten the prompt (or post-process to
+  the brand's sentence/window) when brand position/snippet is actually consumed (step 4+ /
+  Phase 3). _Raised: 2026-07-17._
+
 ## Token custody / refresh locking
 
 - **Webhook refresh path is pool-coupled and can deadlock under concurrent same-shop webhook
