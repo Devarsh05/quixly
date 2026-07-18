@@ -102,13 +102,20 @@ async def run_extractor(
     client: ExtractorClient,
     store_aliases: Iterable[str] = STORE_ALIASES,
     *,
+    run_id: int | None = None,
     max_concurrency: int | None = None,
     force: bool = False,
 ) -> ExtractorReport:
-    """Extract, ground, and self-match brands for a panel's engine_runs; UPDATE the two columns."""
+    """Extract, ground, and self-match brands for a panel's engine_runs; UPDATE the two columns.
+
+    When ``run_id`` is set, the selection is additionally scoped to that run's rows, so the route
+    can extract exactly one scan; when None, behavior is unchanged (all of the panel's rows).
+    """
     concurrency = max_concurrency or get_settings().extractor_max_concurrency
 
     statement = select(EngineRun).where(EngineRun.panel_id == panel_id)
+    if run_id is not None:
+        statement = statement.where(EngineRun.run_id == run_id)
     if not force:
         statement = statement.where(EngineRun.cited_brands_json.is_(None))
     rows = (await session.execute(statement)).scalars().all()
