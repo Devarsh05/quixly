@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 
 from app.graph.engine_runner import _map_sources, run_engine
 from app.graph.interrogator import build_query_panel
-from app.models import EngineRun, Shop, ShopStatus
+from app.models import AgentRun, AgentRunStatus, EngineRun, Shop, ShopStatus
 from app.models import QueryPanel as QueryPanelRow
 from app.services.perplexity import (
     PERPLEXITY_ENDPOINT,
@@ -139,6 +139,38 @@ async def test_fan_out_writes_one_row_per_query_with_sources_and_null_extractor_
         # The Extractor fills these in step 3 — never EngineRunner.
         assert row.cited_brands_json is None
         assert row.our_mentions_json is None
+
+
+async def test_run_id_stamps_every_row_and_defaults_null(db, shop):
+    panel = build_query_panel(max_queries=3)
+    client = FakeEngineClient()
+
+    # Unscoped call (no run_id): every row gets NULL run_id — pre-run-identity behavior.
+    unscoped = await run_engine(db, panel, shop.id, client)
+    unscoped_rows = (
+        await db.execute(select(EngineRun).where(EngineRun.panel_id == unscoped.panel_id))
+    ).scalars().all()
+    assert len(unscoped_rows) == 3
+    assert all(row.run_id is None for row in unscoped_rows)
+
+    # A run over the same (now-existing) panel; every row written this call is stamped with it.
+    run = AgentRun(shop_id=shop.id, panel_id=unscoped.panel_id, status=AgentRunStatus.running)
+    db.add(run)
+    await db.commit()
+    await db.refresh(run)
+
+    scoped = await run_engine(db, panel, shop.id, client, run_id=run.id)
+    assert scoped.panel_id == unscoped.panel_id  # same panel reused by fingerprint
+
+    scoped_rows = (
+        await db.execute(
+            select(EngineRun).where(
+                EngineRun.panel_id == scoped.panel_id, EngineRun.run_id == run.id
+            )
+        )
+    ).scalars().all()
+    assert len(scoped_rows) == 3
+    assert all(row.run_id == run.id for row in scoped_rows)
 
 
 async def test_identical_rerun_reuses_the_panel_row_and_accumulates_engine_runs(db, shop):

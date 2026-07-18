@@ -88,9 +88,14 @@ async def run_engine(
     shop_id: int,
     client: EngineClient,
     *,
+    run_id: int | None = None,
     max_concurrency: int | None = None,
 ) -> EngineRunReport:
-    """Fan ``panel`` across ``client``'s engine, persist every result, return a typed report."""
+    """Fan ``panel`` across ``client``'s engine, persist every result, return a typed report.
+
+    When ``run_id`` is set, every ``engine_runs`` row is stamped with it so aggregation can scope
+    to one scan; when None, rows get NULL run_id (pre-run-identity behavior, unchanged).
+    """
     concurrency = max_concurrency or get_settings().engine_max_concurrency
     panel_id = await _upsert_panel(session, panel, shop_id)
 
@@ -121,6 +126,7 @@ async def run_engine(
             query=query_text,
             response_raw=response_raw,
             cited_sources_json=cited_sources,
+            run_id=run_id,  # NULL when unscoped; stamps the scan otherwise (step 5).
             # cited_brands_json / our_mentions_json intentionally left NULL — Extractor (step 3).
         )
         session.add(row)

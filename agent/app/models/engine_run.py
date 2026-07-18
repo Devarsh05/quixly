@@ -35,6 +35,12 @@ class EngineRun(Base):
     cited_brands_json: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     our_mentions_json: Mapped[list | None] = mapped_column(JSONB, nullable=True)
 
+    # Run identity (step 5). NULLABLE: pre-run rows and un-scoped calls leave it NULL.
+    # ondelete SET NULL — deleting run metadata must NOT destroy raw measurement rows.
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+
     ts: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
