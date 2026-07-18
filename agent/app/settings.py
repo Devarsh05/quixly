@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     # AI shopping-engine API keys (optional until Phase 2 wiring; no secret defaults).
     # SecretStr so the key can never surface in a repr, log line, or traceback.
     perplexity_api_key: SecretStr = Field(default=SecretStr(""))
-    openai_api_key: str | None = Field(default=None)
+    openai_api_key: SecretStr = Field(default=SecretStr(""))
     gemini_api_key: str | None = Field(default=None)
 
     # EngineRunner / Perplexity Sonar knobs.
@@ -48,6 +48,17 @@ class Settings(BaseSettings):
     perplexity_timeout_seconds: float = 30.0
     engine_max_concurrency: int = 5
     engine_max_retries: int = 3
+
+    # Extractor (OpenAI Structured Outputs) knobs.
+    openai_extractor_model: str = "gpt-5-nano"
+    openai_timeout_seconds: float = 30.0
+    # gpt-5-nano is a reasoning model. Strict-schema extraction needs no reasoning; unpinned
+    # effort wastes output-billed reasoning tokens + latency on every row. Bump to "low" only if
+    # live-test ranking quality is poor. (No temperature knob: reasoning models reject a
+    # non-default temperature — extraction determinism comes from the strict schema + prompt.)
+    extractor_reasoning_effort: str = "minimal"
+    extractor_max_concurrency: int = 5
+    extractor_max_retries: int = 3
 
 
 @lru_cache
