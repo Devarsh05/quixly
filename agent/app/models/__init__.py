@@ -5,6 +5,7 @@ from app.models.engine_run import EngineRun
 from app.models.ingest_run import IngestRun, IngestStatus
 from app.models.product import Product
 from app.models.query_panel import QueryPanel
+from app.models.share_of_model import ShareOfModel
 from app.models.shop import Shop, ShopStatus
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "IngestStatus",
     "Product",
     "QueryPanel",
+    "ShareOfModel",
     "Shop",
     "ShopStatus",
 ]

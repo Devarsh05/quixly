@@ -19,7 +19,6 @@ client are injected, so tests drive it against the transaction-scoped ``db`` fix
 
 import asyncio
 import logging
-import re
 from collections.abc import Iterable
 
 from pydantic import BaseModel
@@ -28,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import EngineRun
 from app.services.extractor_llm import ExtractedBrand, ExtractedBrands, ExtractorClient
+from app.services.matching import normalize_and_match, normalize_text
 from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -35,20 +35,6 @@ logger = logging.getLogger(__name__)
 # The store's own brand identity, for self-mention matching. Placeholder module constant until the
 # step-4 org-memory work persists brand identity + the competitor set. `shops` has no name column.
 STORE_ALIASES: tuple[str, ...] = ("Northwind Coffee", "Northwind", "Northwind Coffee Roasters")
-
-# Trailing tokens stripped before brand-alias matching, so "Northwind Coffee Roasters",
-# "Northwind Coffee", and "Northwind" all collapse to the same key.
-_STRIP_SUFFIXES = {"coffee", "roasters", "roaster", "co", "company", "inc"}
-
-_PUNCT = re.compile(r"[^\w\s]")
-
-
-class BrandMatch(BaseModel):
-    """An extracted name matched to a store/competitor alias, keyed by its input position."""
-
-    index: int  # 0-based position in the input name list
-    name: str  # the extracted brand name as given
-    matched_alias: str  # the canonical alias it matched
 
 
 class RejectedHallucination(BaseModel):
@@ -75,50 +61,14 @@ class ExtractorReport(BaseModel):
     failures: list[ExtractionFailure]
 
 
-def _normalize_text(text: str) -> str:
-    """Casefold, replace punctuation with spaces, and collapse whitespace."""
-    return " ".join(_PUNCT.sub(" ", text).casefold().split())
-
-
-def _normalize_brand(name: str) -> str:
-    """Normalize a brand name and strip trailing generic suffixes (coffee/roasters/co/...)."""
-    tokens = _normalize_text(name).split()
-    while tokens and tokens[-1] in _STRIP_SUFFIXES:
-        tokens.pop()
-    return " ".join(tokens)
-
-
 def _is_grounded(brand: str, answer_text: str) -> bool:
     """True iff ``brand`` appears in ``answer_text`` under normalized substring matching.
 
     The anti-fabrication guard: literal presence only, no suffix stripping (that is for alias
     matching). An empty normalized brand never matches.
     """
-    needle = _normalize_text(brand)
-    return bool(needle) and needle in _normalize_text(answer_text)
-
-
-def normalize_and_match(extracted_names: list[str], alias_set: Iterable[str]) -> list[BrandMatch]:
-    """Match extracted brand names against an alias set by normalized, suffix-stripped equality.
-
-    Returns one ``BrandMatch`` per matching name, carrying its input ``index`` so the caller can map
-    it back to a rank/product. Designed to be reused verbatim in step 4 by passing the competitor
-    alias set instead of ``STORE_ALIASES``.
-    """
-    # Normalized alias -> first original alias string (aliases that collapse to the same key share
-    # one canonical label).
-    canonical: dict[str, str] = {}
-    for alias in alias_set:
-        norm = _normalize_brand(alias)
-        if norm and norm not in canonical:
-            canonical[norm] = alias
-
-    matches: list[BrandMatch] = []
-    for index, name in enumerate(extracted_names):
-        norm = _normalize_brand(name)
-        if norm and norm in canonical:
-            matches.append(BrandMatch(index=index, name=name, matched_alias=canonical[norm]))
-    return matches
+    needle = normalize_text(brand)
+    return bool(needle) and needle in normalize_text(answer_text)
 
 
 def _answer_text(response_raw: dict) -> str | None:
