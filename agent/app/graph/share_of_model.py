@@ -1,10 +1,11 @@
 """ShareOfModelAggregator — turns persisted extractions into per-engine mention rates (PRD §6).
 
 The measurement node. EngineRunner writes one ``engine_runs`` row per (query, engine) — INSERT
-only, ``ts``-stamped, so runs accumulate period over period — and the Extractor fills each row's
-``cited_brands_json`` / ``our_mentions_json``. This node reads those rows for a panel and, per
-engine, computes the store's **mention rate** (the metric) and each tracked competitor's mention
-rate, then UPSERTs one ``share_of_model`` row per engine.
+only, ``ts``-stamped, so rows accumulate across scans — and stamps each with a ``run_id`` (step 5);
+the Extractor fills each row's ``cited_brands_json`` / ``our_mentions_json``. This node reads a
+single scan's rows (``WHERE run_id = ...``) and, per engine, computes the store's **mention rate**
+(the metric) and each tracked competitor's mention rate, then UPSERTs one ``share_of_model`` row
+per engine.
 
 It makes **no external API calls** — pure aggregation over persisted rows — so there is no live
 contract to test; every test is DB-backed. The session is injected so tests drive it against the
@@ -12,11 +13,10 @@ transaction-scoped ``db`` fixture.
 
 Two load-bearing rules (decided with the product owner):
 
-1. **Latest-wins, then usable.** Within an engine, dedup to the LATEST run per query
-   (``max(ts)``, tie-broken by ``max(id)``) over *all* runs, then classify that latest run as
-   usable (``cited_brands_json`` present) or not. A query whose current standing is an
-   error/unextracted run is excluded from the denominator even if an older run was extracted —
-   we count current standings only.
+1. **Aggregation is scoped to one run.** ``run_id`` (the agent_run) supplies shop_id/panel_id and
+   pins the rows to a single scan, so accumulated cross-scan rows never bleed together. The
+   latest-per-``(engine, query)`` dedup remains as *defensive insurance* (one run should already
+   hold one row per pair), not as the scan-identity mechanism it once proxied.
 2. **``our_rate`` is NULL on a fully-degraded scan**, never ``0.0``. ``0/0`` is *no data*, not
    *0%*; writing ``0.0`` would be a false 0%-recommendation finding a merchant would act on.
 
@@ -29,14 +29,13 @@ flat mention rate.
 """
 
 from collections import defaultdict
-from datetime import date
 
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import EngineRun, ShareOfModel
+from app.models import AgentRun, EngineRun, ShareOfModel
 from app.models import QueryPanel as QueryPanelRow
 from app.services.matching import normalize_and_match
 
@@ -91,38 +90,37 @@ def _latest_per_query(runs: list[EngineRun]) -> dict[str, dict[str, EngineRun]]:
 
 async def run_share_of_model(
     session: AsyncSession,
-    panel_id: int,
+    run_id: int,
     *,
     period: str | None = None,
     competitor_aliases: dict[str, tuple[str, ...]] = COMPETITOR_ALIASES,
 ) -> ShareOfModelReport:
-    """Aggregate a panel's engine_runs into per-engine mention rates; UPSERT one row per engine."""
-    panel = (
-        await session.execute(select(QueryPanelRow).where(QueryPanelRow.id == panel_id))
+    """Aggregate one scan's engine_runs into per-engine mention rates; UPSERT one row per engine.
+
+    Scoped by ``run_id`` (the agent_run) — the run supplies shop_id/panel_id and pins the rows to a
+    single scan, so accumulated cross-scan rows never bleed together. Raises ``NoResultFound`` on an
+    unknown ``run_id``.
+    """
+    run = (
+        await session.execute(select(AgentRun).where(AgentRun.id == run_id))
     ).scalar_one()
-    shop_id = panel.shop_id
+    shop_id = run.shop_id
+    panel = (
+        await session.execute(select(QueryPanelRow).where(QueryPanelRow.id == run.panel_id))
+    ).scalar_one()
     # Coverage is measured against the panel's full scope so a query that never ran also counts
     # against it, not only engine errors.
     panel_query_count = len(panel.queries_json)
 
     runs = (
-        await session.execute(select(EngineRun).where(EngineRun.panel_id == panel_id))
+        await session.execute(select(EngineRun).where(EngineRun.run_id == run_id))
     ).scalars().all()
+    # One run should hold one row per (engine, query); the dedup stays as defensive insurance.
     latest = _latest_per_query(runs)
 
-    # period defaults to the ISO date of the latest usable run across all engines.
-    usable_runs = [
-        run
-        for by_query in latest.values()
-        for run in by_query.values()
-        if run.cited_brands_json is not None
-    ]
+    # A run is a point-in-time scan, so period defaults to its start date (caller override wins).
     if period is None:
-        period = (
-            max(run.ts for run in usable_runs).date().isoformat()
-            if usable_runs
-            else date.today().isoformat()
-        )
+        period = run.started_at.date().isoformat()
 
     engines_out: list[EngineShare] = []
     for engine in sorted(latest):
@@ -188,4 +186,4 @@ async def run_share_of_model(
         )
 
     await session.commit()
-    return ShareOfModelReport(panel_id=panel_id, period=period, engines=engines_out)
+    return ShareOfModelReport(panel_id=panel.id, period=period, engines=engines_out)
