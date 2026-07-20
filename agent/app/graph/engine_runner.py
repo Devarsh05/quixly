@@ -20,12 +20,11 @@ import asyncio
 import logging
 
 from pydantic import BaseModel
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.graph.interrogator import QueryPanel
 from app.models import EngineRun
-from app.models import QueryPanel as QueryPanelRow
+from app.services.panels import upsert_panel
 from app.services.perplexity import EngineAnswer, EngineClient
 from app.settings import get_settings
 
@@ -64,24 +63,6 @@ def _map_sources(answer: EngineAnswer) -> list[dict]:
     return [{"url": url} for url in answer.citations]
 
 
-async def _upsert_panel(session: AsyncSession, panel: QueryPanel, shop_id: int) -> int:
-    """Insert the panel, or reuse the row for ``(shop_id, fingerprint)``. Returns its id."""
-    statement = insert(QueryPanelRow).values(
-        shop_id=shop_id,
-        category=panel.category,
-        queries_json=[q.model_dump() for q in panel.queries],
-        fingerprint=panel.fingerprint,
-    )
-    statement = statement.on_conflict_do_update(
-        index_elements=[QueryPanelRow.shop_id, QueryPanelRow.fingerprint],
-        # Touch category so RETURNING yields the id on conflict too. queries_json is a pure
-        # function of the fingerprint, so this is a no-op refresh, not a semantic change.
-        set_={"category": statement.excluded.category},
-    ).returning(QueryPanelRow.id)
-
-    return (await session.execute(statement)).scalar_one()
-
-
 async def run_engine(
     session: AsyncSession,
     panel: QueryPanel,
@@ -97,7 +78,7 @@ async def run_engine(
     to one scan; when None, rows get NULL run_id (pre-run-identity behavior, unchanged).
     """
     concurrency = max_concurrency or get_settings().engine_max_concurrency
-    panel_id = await _upsert_panel(session, panel, shop_id)
+    panel_id = await upsert_panel(session, panel, shop_id)
 
     semaphore = asyncio.Semaphore(concurrency)
 
