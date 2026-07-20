@@ -112,6 +112,17 @@ async def _rows(db, shop_id: int) -> list[ShareOfModel]:
     return list(result.scalars().all())
 
 
+async def _rows_by_run(db, run_id: int) -> list[ShareOfModel]:
+    # The aggregate's identity is now (run_id, engine); fetch by run to reflect that.
+    result = await db.execute(
+        select(ShareOfModel)
+        .where(ShareOfModel.run_id == run_id)
+        .order_by(ShareOfModel.engine)
+        .execution_options(populate_existing=True)
+    )
+    return list(result.scalars().all())
+
+
 # --- hand-computed rates, one engine; period defaults to the run's start date ----------------
 
 
@@ -220,27 +231,29 @@ async def test_alias_matching_bridges_short_name(db, shop):
     assert engine.competitor_rates["Onyx Coffee Lab"].mention_rate == 1.0
 
 
-# --- upsert idempotency: same run + period updates in place -----------------------------------
+# --- upsert idempotency: re-aggregating the SAME run updates in place --------------------------
 
 
-async def test_upsert_idempotent_same_period(db, shop):
+async def test_upsert_idempotent_same_run(db, shop):
+    # Identity is (run_id, engine): re-aggregating the same run updates its row in place instead
+    # of inserting a duplicate — even if the period label is unchanged.
     panel = await _make_panel(db, shop.id, query_count=1)
     run = await _make_run(db, shop.id, panel.id)
     _add_run(db, panel.id, run.id, "q0", brands=["Northwind"], mentioned=True)
     await db.commit()
 
     await run_share_of_model(db, run.id, period="2026-07-17")
-    rows = await _rows(db, shop.id)
+    rows = await _rows_by_run(db, run.id)
     assert len(rows) == 1
     assert rows[0].our_rate == 1.0
 
-    # Repoint q0 at a not-mentioned run and re-aggregate the same run/period → one row, updated.
+    # Repoint q0 at a not-mentioned run and re-aggregate the same run → one row, updated in place.
     er = (await db.execute(select(EngineRun).where(EngineRun.query == "q0"))).scalar_one()
     er.our_mentions_json = _mentions(False)
     await db.commit()
 
     await run_share_of_model(db, run.id, period="2026-07-17")
-    rows = await _rows(db, shop.id)
+    rows = await _rows_by_run(db, run.id)
     assert len(rows) == 1
     assert rows[0].our_rate == 0.0
 
@@ -270,12 +283,13 @@ async def test_fully_degraded_engine_writes_null_rate(db, shop):
     assert row.competitor_rates_json == {}
 
 
-# --- run isolation: aggregating one run does not see another run's rows -----------------------
+# --- run isolation: two same-day scans produce two DISTINCT rows, no collision -----------------
 
 
-async def test_run_isolation_same_panel(db, shop):
-    # The core guarantee run identity buys: two scans of the SAME panel, different brand data.
-    # Aggregating run A must reflect only A's rows, never B's.
+async def test_run_isolation_same_panel_and_period(db, shop):
+    # The guarantee this step adds: two scans of the SAME panel on the SAME period no longer
+    # collide. Under the old (shop_id, engine, period) key the second run overwrote the first;
+    # keyed on (run_id, engine) they persist as two DISTINCT rows, each with its own run's rates.
     panel = await _make_panel(db, shop.id, query_count=1)
     run_a = await _make_run(db, shop.id, panel.id)
     run_b = await _make_run(db, shop.id, panel.id)
@@ -285,13 +299,28 @@ async def test_run_isolation_same_panel(db, shop):
     _add_run(db, panel.id, run_b.id, "q0", brands=["Blue Bottle"], mentioned=False)
     await db.commit()
 
-    report_a = await run_share_of_model(db, run_a.id, period="A")
+    # Same period label for both — the exact collision the old key could not survive.
+    report_a = await run_share_of_model(db, run_a.id, period="2026-07-17")
+    report_b = await run_share_of_model(db, run_b.id, period="2026-07-17")
+
+    # Two distinct persisted rows, one per run — the second did NOT overwrite the first.
+    rows_a = await _rows_by_run(db, run_a.id)
+    rows_b = await _rows_by_run(db, run_b.id)
+    assert len(rows_a) == 1
+    assert len(rows_b) == 1
+    assert rows_a[0].id != rows_b[0].id
+    assert rows_a[0].period == rows_b[0].period == "2026-07-17"
+    assert rows_a[0].our_rate == 1.0
+    assert rows_b[0].our_rate == 0.0
+    # And this shop now has two share_of_model rows for the same period, not one overwritten.
+    assert len(await _rows(db, shop.id)) == 2
+
+    # Each report still reflects only its own run's rows.
     (engine_a,) = report_a.engines
     assert engine_a.total_queries == 1
     assert engine_a.our_rate == 1.0  # only A's mention — B's row is invisible
     assert engine_a.competitor_rates["Blue Bottle"].mentions == 0
 
-    report_b = await run_share_of_model(db, run_b.id, period="B")
     (engine_b,) = report_b.engines
     assert engine_b.total_queries == 1
     assert engine_b.our_rate == 0.0
