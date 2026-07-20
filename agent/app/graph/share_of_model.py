@@ -154,6 +154,7 @@ async def run_share_of_model(
                 )
 
         statement = insert(ShareOfModel).values(
+            run_id=run_id,
             shop_id=shop_id,
             engine=engine,
             period=period,
@@ -163,7 +164,7 @@ async def run_share_of_model(
             competitor_rates_json={n: cr.model_dump() for n, cr in competitor_rates.items()},
         )
         statement = statement.on_conflict_do_update(
-            constraint="uq_share_of_model_shop_engine_period",
+            constraint="uq_share_of_model_run_engine",
             set_={
                 "our_rate": statement.excluded.our_rate,
                 "our_mentions": statement.excluded.our_mentions,
