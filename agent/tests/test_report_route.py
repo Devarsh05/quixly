@@ -1,4 +1,4 @@
-"""GET /shops/{shop_id}/report: read persisted share_of_model rates, resolved by run_id.
+"""GET /shops/by-domain/{shop_domain}/report: read persisted share_of_model rates, by run_id.
 
 Rows are seeded directly (no task run). Resolution is purely by run_id since step 6a, so a
 running run with no rows reports status without a 500, and two same-day runs stay distinct.
@@ -81,7 +81,7 @@ async def _som(
 
 
 async def test_requires_the_internal_key(client, shop):
-    response = await client.get(f"/shops/{shop.id}/report")
+    response = await client.get(f"/shops/by-domain/{SHOP}/report")
     assert response.status_code == 401
 
 
@@ -90,7 +90,7 @@ async def test_completed_run_returns_persisted_rates(client, db, shop):
     run = await _run(db, shop.id, panel.id)
     await _som(db, run.id, shop.id)
 
-    response = await client.get(f"/shops/{shop.id}/report?run_id={run.id}", headers=HEADERS)
+    response = await client.get(f"/shops/by-domain/{SHOP}/report?run_id={run.id}", headers=HEADERS)
     assert response.status_code == 200
     body = response.json()
     assert body["run_id"] == run.id
@@ -109,7 +109,7 @@ async def test_running_run_returns_status_without_500(client, db, shop):
     run = await _run(db, shop.id, panel.id, status=AgentRunStatus.running)
     # No share_of_model rows written yet — a running run has none by construction.
 
-    response = await client.get(f"/shops/{shop.id}/report?run_id={run.id}", headers=HEADERS)
+    response = await client.get(f"/shops/by-domain/{SHOP}/report?run_id={run.id}", headers=HEADERS)
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "running"
@@ -121,7 +121,7 @@ async def test_null_our_rate_serializes_as_null(client, db, shop):
     run = await _run(db, shop.id, panel.id)
     await _som(db, run.id, shop.id, our_rate=None, our_mentions=0, total_queries=0, competitors={})
 
-    response = await client.get(f"/shops/{shop.id}/report?run_id={run.id}", headers=HEADERS)
+    response = await client.get(f"/shops/by-domain/{SHOP}/report?run_id={run.id}", headers=HEADERS)
     body = response.json()
     engine = body["engines"][0]
     assert engine["our_rate"] is None  # JSON null — "no data", never 0.0
@@ -135,7 +135,7 @@ async def test_latest_run_is_the_default(client, db, shop):
     newer = await _run(db, shop.id, panel.id)
     await _som(db, newer.id, shop.id, our_rate=0.9)
 
-    response = await client.get(f"/shops/{shop.id}/report", headers=HEADERS)
+    response = await client.get(f"/shops/by-domain/{SHOP}/report", headers=HEADERS)
     body = response.json()
     assert body["run_id"] == newer.id
     assert body["engines"][0]["our_rate"] == 0.9
@@ -151,10 +151,10 @@ async def test_two_same_period_runs_resolve_distinctly(client, db, shop):
     await _som(db, run_b.id, shop.id, period="2026-07-20", our_rate=0.0)
 
     body_a = (
-        await client.get(f"/shops/{shop.id}/report?run_id={run_a.id}", headers=HEADERS)
+        await client.get(f"/shops/by-domain/{SHOP}/report?run_id={run_a.id}", headers=HEADERS)
     ).json()
     body_b = (
-        await client.get(f"/shops/{shop.id}/report?run_id={run_b.id}", headers=HEADERS)
+        await client.get(f"/shops/by-domain/{SHOP}/report?run_id={run_b.id}", headers=HEADERS)
     ).json()
     assert body_a["engines"][0]["our_rate"] == 1.0
     assert body_b["engines"][0]["our_rate"] == 0.0
@@ -162,9 +162,11 @@ async def test_two_same_period_runs_resolve_distinctly(client, db, shop):
 
 async def test_unknown_shop_or_run_404(client, db, shop):
     # Unknown shop (no runs at all).
-    assert (await client.get("/shops/999999/report", headers=HEADERS)).status_code == 404
+    assert (
+        await client.get("/shops/by-domain/nobody.myshopify.com/report", headers=HEADERS)
+    ).status_code == 404
     # Known shop, unknown run_id.
     panel = await _panel(db, shop.id)
     await _run(db, shop.id, panel.id)
-    response = await client.get(f"/shops/{shop.id}/report?run_id=888888", headers=HEADERS)
+    response = await client.get(f"/shops/by-domain/{SHOP}/report?run_id=888888", headers=HEADERS)
     assert response.status_code == 404
