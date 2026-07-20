@@ -210,7 +210,11 @@ async def test_one_failing_query_does_not_sink_the_batch(db, shop):
     assert failed[0].error
 
     row = (
-        await db.execute(select(EngineRun).where(EngineRun.query == doomed))
+        await db.execute(
+            select(EngineRun).where(
+                EngineRun.query == doomed, EngineRun.panel_id == report.panel_id
+            )
+        )
     ).scalar_one()
     assert row.response_raw == {"error": failed[0].error}
     assert row.cited_sources_json is None

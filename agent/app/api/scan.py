@@ -1,11 +1,14 @@
 """Visibility scan orchestration + report (PRD §9).
 
-``POST /shops/{shop_id}/scan`` is QUEUED: one run makes tens of engine + extractor calls, far
-too long to hold a request open. The route creates and COMMITS the panel + agent_run, then
-enqueues the Arq job and returns 202 with the run_id. A crash before/at task start is therefore
-visible as a stuck ``running`` run, never a missing one.
+Both routes are keyed on ``shop_domain`` (the cross-service identity the app shell holds),
+mirroring ``GET /shops/by-domain/{shop_domain}/ingest/latest`` — the integer PK is agent-internal.
 
-``GET /shops/{shop_id}/report`` READS the persisted ``share_of_model`` rows for a run — it does
+``POST /shops/by-domain/{shop_domain}/scan`` is QUEUED: one run makes tens of engine + extractor
+calls, far too long to hold a request open. The route creates and COMMITS the panel + agent_run,
+then enqueues the Arq job and returns 202 with the run_id. A crash before/at task start is
+therefore visible as a stuck ``running`` run, never a missing one.
+
+``GET /shops/by-domain/{shop_domain}/report`` READS the persisted ``share_of_model`` rows for a run — it does
 NOT re-aggregate. Resolution is purely by ``run_id`` (``share_of_model`` is keyed on
 ``(run_id, engine)`` since step 6a): a still-running run has no rows yet, so it naturally reports
 ``status=running`` with ``engines: []`` — no special-casing — and two same-day scans never bleed
@@ -68,14 +71,20 @@ async def _enqueue(run_id: int) -> None:
 
 
 @router.post(
-    "/{shop_id}/scan",
+    "/by-domain/{shop_domain}/scan",
     response_model=ScanResponse,
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(require_internal_api_key)],
 )
-async def start_scan(shop_id: int, db: DbSession) -> ScanResponse:
-    """Create + commit a panel and a ``running`` agent_run, enqueue the scan job, return 202."""
-    shop = (await db.execute(select(Shop).where(Shop.id == shop_id))).scalar_one_or_none()
+async def start_scan(shop_domain: str, db: DbSession) -> ScanResponse:
+    """Create + commit a panel and a ``running`` agent_run, enqueue the scan job, return 202.
+
+    Keyed on ``shop_domain`` — the cross-service identity the app shell holds — mirroring
+    ``GET /shops/by-domain/{shop_domain}/ingest/latest``. The integer PK is agent-internal.
+    """
+    shop = (
+        await db.execute(select(Shop).where(Shop.shop_domain == shop_domain))
+    ).scalar_one_or_none()
     if shop is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Shop not found.")
 
@@ -91,27 +100,36 @@ async def start_scan(shop_id: int, db: DbSession) -> ScanResponse:
 
 
 @router.get(
-    "/{shop_id}/report",
+    "/by-domain/{shop_domain}/report",
     response_model=ReportResponse,
     dependencies=[Depends(require_internal_api_key)],
 )
 async def get_report(
-    shop_id: int,
+    shop_domain: str,
     db: DbSession,
     run_id: int | None = None,
 ) -> ReportResponse:
-    """The persisted share-of-model rates for a run (the shop's latest run if unspecified)."""
+    """The persisted share-of-model rates for a run (the shop's latest run if unspecified).
+
+    Keyed on ``shop_domain`` (see ``start_scan``). Resolves the shop, then the run.
+    """
+    shop = (
+        await db.execute(select(Shop).where(Shop.shop_domain == shop_domain))
+    ).scalar_one_or_none()
+    if shop is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Shop not found.")
+
     if run_id is not None:
         run = (
             await db.execute(
-                select(AgentRun).where(AgentRun.id == run_id, AgentRun.shop_id == shop_id)
+                select(AgentRun).where(AgentRun.id == run_id, AgentRun.shop_id == shop.id)
             )
         ).scalar_one_or_none()
     else:
         run = (
             await db.execute(
                 select(AgentRun)
-                .where(AgentRun.shop_id == shop_id)
+                .where(AgentRun.shop_id == shop.id)
                 .order_by(AgentRun.id.desc())
                 .limit(1)
             )
