@@ -8,8 +8,8 @@ calls, far too long to hold a request open. The route creates and COMMITS the pa
 then enqueues the Arq job and returns 202 with the run_id. A crash before/at task start is
 therefore visible as a stuck ``running`` run, never a missing one.
 
-``GET /shops/by-domain/{shop_domain}/report`` READS the persisted ``share_of_model`` rows for a run — it does
-NOT re-aggregate. Resolution is purely by ``run_id`` (``share_of_model`` is keyed on
+``GET /shops/by-domain/{shop_domain}/report`` READS the persisted ``share_of_model`` rows for a
+run — it does NOT re-aggregate. Resolution is purely by ``run_id`` (``share_of_model`` is keyed on
 ``(run_id, engine)`` since step 6a): a still-running run has no rows yet, so it naturally reports
 ``status=running`` with ``engines: []`` — no special-casing — and two same-day scans never bleed
 into each other. ``coverage`` is derived from the run's panel (not persisted); a NULL ``our_rate``
