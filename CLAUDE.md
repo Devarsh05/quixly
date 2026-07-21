@@ -16,6 +16,19 @@ uplift. Full spec: see `PRD.md` (read it before large changes).
 ## Commands
 - Infra (both services): `docker compose up -d` (Postgres + Redis)
 - App shell: `cd app && npm install`, `npm run dev`, `npm run build`, `npm run lint`
+- **Dev with live webhooks (needs a stable public URL).** Bare `npm run dev` (`shopify app dev`)
+  spawns a **rotating Cloudflare quick-tunnel** — a new URL every restart — so Shopify keeps
+  delivering to the last-released `application_url` and webhooks never reach local. Use the
+  reserved ngrok domain instead: start ngrok first (forwarding to `:3000`), then
+  `shopify app dev --tunnel-url="https://debating-persuaded-patrol.ngrok-free.dev:3000"`.
+  The app's dev port is pinned to **3001** in `app/shopify.web.toml` (kept local): with
+  `--tunnel-url=…:3000` the CLI proxy binds 3000 and forwards to its own declared app port, so
+  leaving the app on 3000 makes the proxy forward to itself. If that file is ever committed, keep
+  the port at **3001**, not 3000.
+- **Windows dev cleanup.** `Ctrl-C` on `shopify app dev` often orphans `node` processes that keep
+  holding ports (3000/3001/3457), causing "port in use" bumps and a proxy self-forward connection
+  storm on the next launch. Before relaunching, kill them: `taskkill /IM node.exe /F` (or the
+  specific PIDs from `netstat -ano | findstr ":3000 :3001"`).
 - Agent: `cd agent && uv sync` (or `pip install -e .`), `uvicorn app.main:app --reload`
 - Tests: app `npm test` (vitest); agent `pytest` (needs Postgres up)
 - Worker (agent): `arq app.worker.WorkerSettings`
@@ -161,6 +174,13 @@ they **break the chain and force the merchant to reinstall**.
   Ingest raises on an unknown status; the webhook logs and keeps the prior value (a raising
   webhook becomes a 500 → Shopify retry storm). Column stays `VARCHAR(32)` nullable, no enum/CHECK
   — adding a status is code-only, no migration. Don't add a write path that bypasses the normalizer.
+- **Forwarded webhooks dispatch on the canonical topic form.** The app shell forwards the topic
+  from `authenticate.webhook()`, which is Shopify's `topicForStorage()` form — **`UPPER_SNAKE`**
+  (e.g. `PRODUCTS_UPDATE`, `APP_UNINSTALLED`), NOT the REST-header form (`products/update`). The
+  agent's dispatch (`agent/app/api/webhooks.py`) must canonicalize the incoming topic and match on
+  `PRODUCTS_UPDATE` / `APP_UNINSTALLED`. Dispatching on the REST form silently no-ops **every**
+  forwarded webhook: the handler returns 204, the app returns 200, and no DB row is written.
+  (Observed 2026-07-21 — a green 200 masking zero DB effect.)
 - **`prisma migrate dev` is LOCAL ONLY** — it can reset the database. Deployed environments
   use `prisma migrate deploy` (this is what CI runs).
 - Do not put running task lists or plans in this file (they go stale) — those live in the PR/issue.
