@@ -1,4 +1,4 @@
-"""POST /shops/{shop_id}/scan: enqueue a scan, committing a running run + panel up front.
+"""POST /shops/by-domain/{shop_domain}/scan: enqueue a scan, committing a running run + panel.
 
 Driven through httpx.ASGITransport (see test_shops_connect for why, not TestClient). The Arq
 enqueue is captured, not executed — no real queue and no task run here.
@@ -53,12 +53,12 @@ async def shop(db):
 
 
 async def test_requires_the_internal_key(client, shop):
-    response = await client.post(f"/shops/{shop.id}/scan")
+    response = await client.post(f"/shops/by-domain/{SHOP}/scan")
     assert response.status_code == 401
 
 
 async def test_scan_returns_202_and_commits_running_run_and_panel(client, db, shop, enqueued):
-    response = await client.post(f"/shops/{shop.id}/scan", headers=HEADERS)
+    response = await client.post(f"/shops/by-domain/{SHOP}/scan", headers=HEADERS)
 
     assert response.status_code == 202
     body = response.json()
@@ -85,6 +85,6 @@ async def test_scan_returns_202_and_commits_running_run_and_panel(client, db, sh
 
 
 async def test_scan_unknown_shop_404_and_enqueues_nothing(client, enqueued):
-    response = await client.post("/shops/999999/scan", headers=HEADERS)
+    response = await client.post("/shops/by-domain/nope.myshopify.com/scan", headers=HEADERS)
     assert response.status_code == 404
     assert enqueued == []
