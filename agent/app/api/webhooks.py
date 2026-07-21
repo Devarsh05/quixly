@@ -33,6 +33,18 @@ class WebhookEnvelope(BaseModel):
     payload: dict[str, Any] = {}
 
 
+def _canonical_topic(topic: str) -> str:
+    """Canonicalise a Shopify webhook topic to the library's stored form.
+
+    ``authenticate.webhook()`` in the app shell returns the topic already run through
+    Shopify's ``topicForStorage`` (``UPPER_SNAKE`` — e.g. ``PRODUCTS_UPDATE``), not the
+    ``products/update`` REST-header form. Normalising here makes dispatch match what the
+    shell actually forwards, while staying tolerant of the REST form (direct internal calls,
+    tests, redeliveries).
+    """
+    return topic.upper().replace("/", "_").replace(".", "_")
+
+
 @router.post(
     "/shopify",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -43,9 +55,10 @@ async def handle_shopify_webhook(
     db: DbSession,
 ) -> None:
     """Dispatch a forwarded Shopify webhook."""
-    if envelope.topic == "app/uninstalled":
+    topic = _canonical_topic(envelope.topic)
+    if topic == "APP_UNINSTALLED":
         await _handle_uninstalled(db, envelope.shop_domain)
-    elif envelope.topic == "products/update":
+    elif topic == "PRODUCTS_UPDATE":
         await _handle_product_update(db, envelope.shop_domain, envelope.payload)
     else:
         logger.info("Ignoring unhandled webhook topic %s", envelope.topic)
