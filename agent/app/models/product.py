@@ -33,5 +33,11 @@ class Product(Base, TimestampMixin):
     gtin: Mapped[str | None] = mapped_column(String(64), nullable=True)
     metafields_json: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     visibility_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Raw merchant fields used to classify the product (coffee / equipment / other) for the
+    # per-class audit rubric. Stored raw — the class is derived deterministically at audit time by
+    # ``services.catalog.classify_product``. ``product_type`` is Shopify's free-text productType;
+    # ``category`` is the Standard-taxonomy fullName when set.
+    product_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    category: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     shop: Mapped["Shop"] = relationship(back_populates="products")  # noqa: F821

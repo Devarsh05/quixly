@@ -49,6 +49,7 @@ async def _write_page(session, shop_id: int, nodes: list[dict[str, Any]]) -> int
     for node in nodes:
         variants = (node.get("variants") or {}).get("nodes") or []
         metafields = (node.get("metafields") or {}).get("nodes") or []
+        category = node.get("category") or {}
         rows.append(
             {
                 "shop_id": shop_id,
@@ -59,6 +60,8 @@ async def _write_page(session, shop_id: int, nodes: list[dict[str, Any]]) -> int
                 "gtin": extract_gtin(variants),
                 "metafields_json": metafields,
                 "visibility_state": _visibility_state(node),
+                "product_type": node.get("productType") or None,
+                "category": category.get("fullName"),
                 "updated_at": datetime.now(UTC),
             }
         )
@@ -73,6 +76,8 @@ async def _write_page(session, shop_id: int, nodes: list[dict[str, Any]]) -> int
             "gtin": statement.excluded.gtin,
             "metafields_json": statement.excluded.metafields_json,
             "visibility_state": statement.excluded.visibility_state,
+            "product_type": statement.excluded.product_type,
+            "category": statement.excluded.category,
             "updated_at": statement.excluded.updated_at,
         },
     )

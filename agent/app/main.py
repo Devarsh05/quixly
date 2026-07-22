@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import scan, shops, webhooks
+from app.api import products, scan, shops, webhooks
 from app.redis import close_redis
 
 
@@ -26,6 +26,7 @@ app = FastAPI(title="Quixly Agent", version="0.1.0", lifespan=lifespan)
 
 app.include_router(shops.router)
 app.include_router(scan.router)
+app.include_router(products.router)
 app.include_router(webhooks.router)
 
 

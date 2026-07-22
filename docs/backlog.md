@@ -13,26 +13,26 @@ the phase by which it should be revisited.
   webhooks) before catalog freshness matters downstream.
   _Raised: 2026-07-15 (Phase 1 closeout)._
 
-- **`products.gtin` picks the first barcoded variant, not necessarily the primary one.**
-  `extract_gtin` (`agent/app/services/catalog.py`) scans `variants_json` in order and returns
-  the first variant that carries a barcode. So a product-level GTIN can be sourced from a
-  **secondary** variant when the primary/default variant has no barcode — which may not be the
-  product's canonical GTIN. (Observed: 14 barcoded variants across the catalog → 11 products
-  with at least one, so 11 product-level GTINs; 9 barcode-free.) Decide the intended rule —
-  primary/default variant, or first-barcoded as today — before **Phase 3 (Optimizer)**, which
-  relies on product-level GTIN for grounding. Every variant's barcode is already preserved in
-  `variants_json`, so this is a selection-rule change, not new data.
-  _Raised: 2026-07-15 (Phase 1 closeout)._
+- **RESOLVED (2026-07-22, Phase 3 step 1): the `products.gtin` first-barcoded rule is intentional
+  and needs no change.** `extract_gtin` (`agent/app/services/catalog.py`) returns the first barcoded
+  variant in `variants_json` order — verified accurate, kept as-is. The trigger ("decide before
+  Phase 3, the Optimizer relies on product-level GTIN for grounding") is void: `products.gtin` is a
+  convenience projection, **not the source of truth** (so documented in `catalog.py` and
+  `models/product.py`). The audit rubric and the Optimizer both read the **variant barcode**
+  (`extract_gtin(variants_json)`) as the single source of truth, and GTIN is gated on product class
+  (third-party equipment, not self-roasted coffee). No product-level selection rule needs deciding.
+  _Raised: 2026-07-15 (Phase 1 closeout); resolved: 2026-07-22._
 
 ## Extractor
 
-- **`verbatim` returns the whole answer, not the brand's local snippet.** Live testing shows the
-  extractor model populates each `ExtractedBrand.verbatim` with the full answer text rather than
-  the local snippet the brand was pulled from. Harmless to grounding — `_is_grounded`
-  (`agent/app/graph/extractor.py`) matches on the brand **name**, not `verbatim` — but useless for
-  the position/context analysis `verbatim` is meant to feed. Tighten the prompt (or post-process to
-  the brand's sentence/window) when brand position/snippet is actually consumed (step 4+ /
-  Phase 3). _Raised: 2026-07-17._
+- **`verbatim` is DISCARDED, not stored — and returns the whole answer.** Two problems, corrected
+  here: (1) the extractor model populates each `ExtractedBrand.verbatim` with the **full answer
+  text** rather than the brand's local snippet; and (2) the Extractor does **not persist verbatim at
+  all** — `cited_brands_json` stores only `{rank, brand, product}`
+  (`agent/app/graph/extractor.py`), and there is **no `engine_runs.verbatim` column**. Harmless to
+  grounding today — `_is_grounded` matches on the brand **name**, not `verbatim`. But consuming
+  verbatim later (e.g. an answer-snippet evidence join) requires BOTH persisting it AND narrowing it
+  to the brand's local sentence/window. _Raised: 2026-07-17; corrected: 2026-07-22._
 
 ## Token custody / refresh locking
 
@@ -64,11 +64,12 @@ the phase by which it should be revisited.
 
 ## Webhooks / delivery
 
-- **End-to-end webhook HMAC delivery is unverified.** Shopify does not deliver live webhooks to a
-  `--use-localhost` app, so `authenticate.webhook` (HMAC verify) and the full `app/uninstalled`
-  chain (Shopify → app shell HMAC → forward → agent → `status = uninstalled`) have never run against
-  a live delivery. The agent-side handler is unit-tested; only live delivery is deferred. Exercise
-  behind a public tunnel. _Raised: 2026-07-16 (Phase 1 closeout)._
+- **RESOLVED (2026-07-21, Gate F): end-to-end webhook HMAC delivery is verified live.** Proven
+  against the dev store (commit `f0b97bc`): a bogus-HMAC POST → **401**; a real product edit →
+  `products/update` **200** + `public.products` written; a real uninstall → `app/uninstalled`
+  **200** + `status = uninstalled`; a real reinstall → re-ingest **20/20**. The topic-dispatch bug
+  found in the process (dispatching on the REST form instead of the library-canonical
+  `PRODUCTS_UPDATE`) was fixed in the same commit. _Raised: 2026-07-16; resolved: 2026-07-21._
 
 ## Compliance
 

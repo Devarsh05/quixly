@@ -126,8 +126,23 @@ def _update_envelope(status: str, topic: str = "PRODUCTS_UPDATE") -> dict:
             "body_html": "<p>New</p>",
             "variants": [{"barcode": "0123456789012"}],
             "status": status,
+            "product_type": "Coffee",
         },
     }
+
+
+@pytest.mark.parametrize("topic", ["PRODUCTS_UPDATE", "products/update"])
+async def test_products_update_captures_product_type(client, db, shop, topic):
+    """The REST payload's product_type is written so the row stays classifiable after an edit."""
+    await _seed_product(db, shop, visibility_state="active")
+
+    response = await client.post(
+        "/webhooks/shopify", json=_update_envelope("active", topic), headers=HEADERS
+    )
+    assert response.status_code == 204
+
+    product = await _product(db)
+    assert product.product_type == "Coffee"
 
 
 # "PRODUCTS_UPDATE" is what the shell forwards; "products/update" is the REST-header form.

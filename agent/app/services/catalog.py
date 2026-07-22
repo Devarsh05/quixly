@@ -1,5 +1,6 @@
 """Catalog normalisation shared by the ingest job and the products/update webhook."""
 
+import re
 from typing import Any
 
 
@@ -39,3 +40,38 @@ def normalize_visibility_state(raw: str | None) -> str:
         return _VISIBILITY_STATES[(raw or "").upper()]
     except KeyError:
         raise ValueError(f"Unmapped Shopify product status {raw!r}") from None
+
+
+# Product class is derived from MERCHANT DATA ONLY — Shopify's productType (and, as a fallback,
+# the Standard-taxonomy category) — never inferred by a model. The audit rubric is per-class, so
+# this classification is deterministic (a keyword lookup, a data change to extend) and load-bearing
+# for Gate G's determinism. The dev store labels beans "Coffee" and equipment "Brewing Gear";
+# `category` is "Uncategorized"/None there, so productType is the signal.
+#
+# Equipment keywords are checked BEFORE coffee so "Coffee Grinder" classifies as equipment, not
+# coffee. Matching is normalized-substring, so "Coffee Beans" → coffee and "Brewing Gear" → gear.
+_EQUIPMENT_KEYWORDS = (
+    "brewing gear", "gear", "equipment", "grinder", "kettle", "filter", "dripper", "brewer",
+    "press", "scale", "machine", "accessor",
+)
+_COFFEE_KEYWORDS = ("coffee", "beans", "espresso", "roast", "decaf")
+
+PRODUCT_CLASS_OTHER = "other"
+
+
+def classify_product(product_type: str | None, category: str | None) -> str:
+    """Classify a product as ``coffee`` / ``equipment`` / ``other`` from merchant fields.
+
+    Deterministic keyword lookup over ``product_type`` (preferred) then ``category``. Returns
+    ``other`` when neither carries a known signal — the rubric then skips spec scoring rather than
+    guessing a vocabulary. ``Uncategorized`` and empty values carry no signal.
+    """
+    for source in (product_type, category):
+        text = re.sub(r"[^\w\s]", " ", (source or "").casefold())
+        if not text.strip() or "uncategorized" in text:
+            continue
+        if any(keyword in text for keyword in _EQUIPMENT_KEYWORDS):
+            return "equipment"
+        if any(keyword in text for keyword in _COFFEE_KEYWORDS):
+            return "coffee"
+    return PRODUCT_CLASS_OTHER
