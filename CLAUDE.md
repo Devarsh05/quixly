@@ -189,3 +189,59 @@ they **break the chain and force the merchant to reinstall**.
 - **Never add AI attribution to commits or PRs.** No `Co-Authored-By: Claude`/AI trailers, no
   "Generated with Claude Code" lines, no AI mentions in commit messages or PR bodies. Write
   commit messages as the human author, plainly describing the change.
+
+## Current Status
+
+Phase tree from `PRD.md` §15; step status is evidence-based (merged PRs + `docs/session-log/`).
+Only items confirmed by committed code or a session log are checked.
+
+### Phase 0 — Scaffold — complete (deploy deferred)
+- [x] Monorepo: `app/` (Shopify React Router template) + `agent/` (FastAPI) independently runnable
+- [x] Local infra: docker-compose Postgres (pgvector) + Redis, Alembic bootstrap, `.env.example` both sides
+- [x] CI: lint + boot check both services (agent `pytest` / ruff, app `npm run build`)
+- [ ] Railway deploy — deferred; local-only dev through Phase 4, required before Phase 5 (Ship). PRD §15 lists it under Phase 0, so it stays visible: "Phase 0 complete" does NOT mean a deployed environment exists
+
+### Phase 1 — Connect — complete
+- [x] Shopify OAuth + embedded app loads in the dev store (`quixly-ljymkoyb.myshopify.com`)
+- [x] Session storage on Postgres via Prisma (`shopify` schema), fenced from Alembic (`public`)
+- [x] Token custody: single refresh authority + per-shop advisory lock; agent `TokenProvider` stores no token
+- [x] Catalog ingestion → `public.products` (20/20, resumable via `ingest_runs.cursor`)
+- [x] `visibility_state` single normalizer (active/draft/archived/unlisted)
+- [x] CI typecheck gate wired (`react-router typegen && tsc --noEmit`)
+
+### Phase 2 — Audit — complete
+- [x] Interrogator: query-panel builder (coffee vertical)
+- [x] EngineRunner: Perplexity Sonar client + `query_panels` / `engine_runs` persistence
+- [x] Extractor: LLM brand extraction + grounding guard + self-mention matching
+- [x] ShareOfModel aggregator, run-scoped on `(run_id, engine)`
+- [x] Agent-run identity: `agent_runs` + `run_id` threaded through EngineRunner/Extractor/aggregator
+- [x] Scan route + orchestration task, keyed on `shop_domain`
+- [x] Read-only report UI: embedded audit page + agent client `startScan` / `getReport`
+- [x] Gate F — live webhook verification: `products/update` (HMAC + DB write) & `app/uninstalled` (status flip); topic-dispatch fix `f0b97bc`; reinstall + re-ingest 20/20
+
+### Phase 3 — Fix — not started
+- [ ] Product audit (per-product gaps vs. grounded source data)
+- [ ] Grounded Optimizer (description + JSON-LD + metafields/GTIN), before/after diff + source per fix
+- [ ] Preview/approve UI behind the mandatory approval gate (`fixes.status = approved`)
+- [ ] Publisher (Admin API writes) — dev store only first, re-read + parse-check after publish
+
+### Phase 4 — Verify — not started
+- [ ] Verifier loop
+- [ ] Uplift chart
+- [ ] Scheduled weekly scans (also keep the refresh chain warm)
+- [ ] Browserbase shopping-agent simulation
+
+### Phase 5 — Ship — not started
+- [ ] Shopify Billing API tiers
+- [ ] Onboarding flow
+- [ ] App Store submission (incl. compliance webhooks `customers/data_request`/`redact`, `shop/redact`)
+- [ ] MCP server
+
+**Next action:** Phase 3 begins with a **plan-first** design of the grounded Optimizer + Publisher
+(Admin API writes) behind the mandatory approval gate — Phase 3 is the first phase that writes to
+live merchant stores, so no code before an approved plan.
+
+## Session Log
+
+Per-session notes of record live in `docs/session-log/` — one file per session, named
+`YYYY-MM-DD-phase-<n>-<slug>.md`. Read the latest before large changes.
