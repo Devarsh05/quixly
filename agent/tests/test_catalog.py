@@ -54,8 +54,12 @@ class TestClassifyProduct:
         # A "Coffee Grinder" is equipment, not coffee — equipment signal takes precedence.
         assert classify_product("Coffee Grinder", None) == "equipment"
 
-    @pytest.mark.parametrize("product_type", [None, "", "Merchandise", "Gift Card"])
+    @pytest.mark.parametrize(
+        "product_type", [None, "", "Merchandise", "Gift Card", "Whole Bean", "Merch"]
+    )
     def test_unmapped_or_missing_type_is_other(self, product_type):
+        # Conservative fallback: only explicitly-known productTypes classify; everything else is
+        # UNSET ("other") so the rubric skips spec scoring rather than guessing a vocabulary.
         assert classify_product(product_type, None) == "other"
 
     def test_uncategorized_category_is_ignored_and_falls_back_to_type(self):

@@ -17,12 +17,15 @@ Pure, deterministic rule checks. The rubric is **per product class**:
 Each branch is seeded distinctly.
 """
 
+import pytest
+
 from app.services.audit_rubric import (
     MISSING_DESCRIPTION,
     MISSING_GTIN,
     SPEC_MISSING,
     evaluate_product,
 )
+from app.services.catalog import classify_product
 
 RICH_BODY = (
     "Single-origin washed Arabica from Ethiopia. Altitude 1,900-2,100 masl. Varietal: Heirloom. "
@@ -139,6 +142,21 @@ def test_other_class_is_not_spec_scored_and_has_no_gtin_gap():
     )
     assert result.spec_coverage is None
     assert MISSING_GTIN not in _codes(result)
+    assert not any(g.code == SPEC_MISSING for g in result.gaps)
+
+
+@pytest.mark.parametrize("product_type", ["Whole Bean", "Merch", "", None])
+def test_unknown_product_type_falls_back_to_unset_not_coffee_vocabulary(product_type):
+    """Full chain: an unmapped/empty/NULL productType classifies to the UNSET class ("other") and
+    is NOT spec-scored — the classifier never guesses the coffee vocabulary for unknown data."""
+    product_class = classify_product(product_type, None)
+    assert product_class == "other"
+
+    result = evaluate_product(
+        title="Something", body="", variants=_variants(None), metafields=None,
+        visibility_state="active", product_class=product_class,
+    )
+    assert result.spec_coverage is None
     assert not any(g.code == SPEC_MISSING for g in result.gaps)
 
 
