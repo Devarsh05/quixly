@@ -19,7 +19,12 @@ TOKEN_URL = f"http://app-shell.test/internal/shops/{SHOP}/admin-token"
 
 
 def _product(
-    pid: int, title: str, barcode: str | None = None, status: str = "ACTIVE"
+    pid: int,
+    title: str,
+    barcode: str | None = None,
+    status: str = "ACTIVE",
+    product_type: str | None = "Coffee",
+    category: str | None = None,
 ) -> dict:
     # `status` mirrors Shopify's GraphQL ProductStatus enum, which is uppercase.
     return {
@@ -27,6 +32,8 @@ def _product(
         "title": title,
         "descriptionHtml": f"<p>{title}</p>",
         "status": status,
+        "productType": product_type,
+        "category": {"fullName": category} if category else None,
         "variants": {"nodes": [{"id": f"gid://shopify/Variant/{pid}", "barcode": barcode}]},
         "metafields": {"nodes": []},
     }
@@ -126,6 +133,49 @@ async def test_writes_products_and_completes(db, shop, run, patched_job):
     assert coffee.title == "Coffee"
     # Shopify's uppercase ACTIVE is normalized to the lowercase canonical.
     assert coffee.visibility_state == "active"
+
+
+async def test_captures_product_type_and_category(db, shop, run, patched_job):
+    """productType and the taxonomy category fullName are ingested onto the product row."""
+    patched_job(
+        FakeAdminClient(
+            [
+                (
+                    [
+                        _product(1, "Ethiopia", product_type="Coffee"),
+                        _product(
+                            2, "Grinder", product_type="Brewing Gear",
+                            category="Home & Garden > Kitchen > Coffee Grinders",
+                        ),
+                        _product(3, "Untyped", product_type=None, category=None),
+                    ],
+                    "cursor-1",
+                )
+            ]
+        )
+    )
+
+    await ingest_catalog({"token_provider": object()}, SHOP, run.id)
+
+    rows = dict(
+        (
+            await db.execute(
+                select(Product.shopify_product_id, Product.product_type).where(
+                    Product.shop_id == shop.id
+                )
+            )
+        ).all()
+    )
+    assert rows["gid://shopify/Product/1"] == "Coffee"
+    assert rows["gid://shopify/Product/2"] == "Brewing Gear"
+    assert rows["gid://shopify/Product/3"] is None
+
+    grinder = (
+        await db.execute(
+            select(Product).where(Product.shopify_product_id == "gid://shopify/Product/2")
+        )
+    ).scalar_one()
+    assert grinder.category == "Home & Garden > Kitchen > Coffee Grinders"
 
 
 async def test_product_status_is_normalized_to_lowercase(db, shop, run, patched_job):

@@ -26,8 +26,12 @@ def upgrade() -> None:
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('product_id', sa.Integer(), nullable=False),
     sa.Column('run_id', sa.Integer(), nullable=True),
+    # product_class snapshots the class the rubric scored against (coffee/equipment/other) so the
+    # Verifier compares like-for-like. spec_coverage is NULLABLE — spec scoring only applies to a
+    # class with a grounded vocabulary (coffee); equipment/other/not-audited carry NULL, not 0.0.
+    sa.Column('product_class', sa.String(length=32), nullable=True),
     sa.Column('gaps_json', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-    sa.Column('spec_coverage', sa.Float(), nullable=False),
+    sa.Column('spec_coverage', sa.Float(), nullable=True),
     sa.Column('severity', sa.String(length=16), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.ForeignKeyConstraint(['product_id'], ['products.id'], ondelete='CASCADE'),

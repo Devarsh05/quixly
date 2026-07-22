@@ -29,6 +29,8 @@ query CatalogPage($cursor: String) {
       title
       descriptionHtml
       status
+      productType
+      category { name fullName }
       variants(first: 100) {
         nodes { id title sku barcode price inventoryQuantity }
       }

@@ -37,8 +37,15 @@ class Audit(Base):
         ForeignKey("agent_runs.id", ondelete="SET NULL"), index=True, nullable=True
     )
 
+    # The class the rubric scored against (coffee / equipment / other), snapshotted so Phase 4's
+    # Verifier compares like-for-like and the report can break down by class.
+    product_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
     gaps_json: Mapped[list] = mapped_column(JSONB, nullable=False)
-    spec_coverage: Mapped[float] = mapped_column(Float, nullable=False)
+    # NULLABLE: spec scoring only applies to classes with a grounded vocabulary (coffee today).
+    # Equipment / other / not-audited (draft) products carry NULL — never a misleading 0.0.
+    spec_coverage: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Bands: none | low | medium | high, plus ``not_audited`` for products excluded from the
+    # population (not visible). Plain String, like the other status columns.
     severity: Mapped[str] = mapped_column(String(16), nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(

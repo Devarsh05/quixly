@@ -98,6 +98,10 @@ async def _handle_product_update(
         "body": payload.get("body_html"),
         "variants_json": variants,
         "gtin": extract_gtin(variants),
+        # REST payload carries product_type (used to classify the product); the taxonomy
+        # `category` is not in the REST webhook payload, so it is left untouched here and
+        # refreshed on the next full ingest.
+        "product_type": payload.get("product_type"),
         "updated_at": datetime.now(UTC),
     }
     # A raising webhook becomes a 500 back to the app shell -> Shopify retry storm and a lost
