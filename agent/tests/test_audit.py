@@ -1,8 +1,8 @@
 """The audit node ``run_audit`` (Phase 3, step 1 — Gate G).
 
-DB-backed (real Postgres ``db`` fixture, rolled back per test). The node loads a product, scores
-it with the deterministic rubric (``services.audit_rubric``), and persists one ``audits`` row.
-No LLM, no external calls, so there is no live test.
+DB-backed (real Postgres ``db`` fixture, rolled back per test). The node loads a product, derives
+its class from merchant fields (``classify_product``), scores it with the per-class rubric, and
+persists one ``audits`` row carrying the class, gaps, nullable spec_coverage, and severity.
 """
 
 import pytest
@@ -33,10 +33,11 @@ async def _product(db, shop_id: int, **overrides) -> Product:
         shopify_product_id="gid://shopify/Product/1",
         title="Ethiopia Yirgacheffe",
         body=RICH_BODY,
-        variants_json=[],
+        variants_json=[{"barcode": "0123456789012"}],
         gtin="0123456789012",
-        metafields_json=[{"namespace": "custom", "key": "roast", "value": "light", "type": "x"}],
+        metafields_json=None,
         visibility_state="active",
+        product_type="Coffee",
     )
     defaults.update(overrides)
     product = Product(shop_id=shop_id, **defaults)
@@ -60,35 +61,47 @@ async def _run(db, shop_id: int) -> AgentRun:
     return run
 
 
-async def test_run_audit_persists_a_row_for_a_clean_product(db, shop):
+async def test_audit_persists_class_and_coverage_for_a_clean_coffee(db, shop):
     product = await _product(db, shop.id)
 
     outcome = await run_audit(db, product.id)
 
-    row = (
-        await db.execute(select(Audit).where(Audit.id == outcome.audit_id))
-    ).scalar_one()
-    assert row.product_id == product.id
-    assert row.run_id is None
+    row = (await db.execute(select(Audit).where(Audit.id == outcome.audit_id))).scalar_one()
+    assert row.product_class == "coffee"
     assert row.severity == "none"
     assert row.spec_coverage == 1.0
     assert row.gaps_json == []
+    assert outcome.audited is True
 
 
-async def test_run_audit_flags_an_empty_product_high(db, shop):
+async def test_audit_equipment_missing_gtin_is_medium_with_null_coverage(db, shop):
     product = await _product(
-        db, shop.id, body=None, gtin=None, metafields_json=None, visibility_state="draft"
+        db, shop.id, title="Gooseneck Kettle", body="A kettle.",
+        variants_json=[{"barcode": None}], gtin=None, product_type="Brewing Gear",
     )
 
     outcome = await run_audit(db, product.id)
 
-    assert outcome.severity == "high"
-    codes = {gap.code for gap in outcome.gaps}
-    expected = {"missing_description", "missing_gtin", "missing_metafields", "not_discoverable"}
-    assert expected <= codes
+    assert outcome.product_class == "equipment"
+    assert outcome.severity == "medium"
+    assert outcome.spec_coverage is None
+    assert {g.code for g in outcome.gaps} == {"missing_gtin"}
 
 
-async def test_run_audit_stamps_run_id_when_scoped(db, shop):
+async def test_audit_excludes_a_draft_product(db, shop):
+    product = await _product(db, shop.id, visibility_state="draft")
+
+    outcome = await run_audit(db, product.id)
+
+    assert outcome.audited is False
+    assert outcome.excluded_reason == "not_visible"
+    row = (await db.execute(select(Audit).where(Audit.id == outcome.audit_id))).scalar_one()
+    assert row.severity == "not_audited"
+    assert row.gaps_json == []
+    assert row.spec_coverage is None
+
+
+async def test_audit_stamps_run_id_when_scoped(db, shop):
     product = await _product(db, shop.id)
     run = await _run(db, shop.id)
 
@@ -98,7 +111,7 @@ async def test_run_audit_stamps_run_id_when_scoped(db, shop):
     assert row.run_id == run.id
 
 
-async def test_run_audit_appends_rather_than_overwrites(db, shop):
+async def test_audit_appends_rather_than_overwrites(db, shop):
     product = await _product(db, shop.id)
 
     await run_audit(db, product.id)
@@ -112,6 +125,6 @@ async def test_run_audit_appends_rather_than_overwrites(db, shop):
     assert count == 2
 
 
-async def test_run_audit_raises_for_unknown_product(db):
+async def test_audit_raises_for_unknown_product(db):
     with pytest.raises(ValueError):
         await run_audit(db, 999999)

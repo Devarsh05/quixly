@@ -47,6 +47,7 @@ async def _product(db, shop_id: int, **overrides) -> Product:
         gtin=None,
         metafields_json=None,
         visibility_state="active",
+        product_type="Coffee",
     )
     defaults.update(overrides)
     product = Product(shop_id=shop_id, **defaults)
@@ -71,9 +72,11 @@ async def test_audit_persists_a_row_and_returns_gaps(client, db, shop):
     body = response.json()
     assert body["product_id"] == product.id
     assert body["run_id"] is None
-    assert body["severity"] == "high"  # empty product
+    assert body["product_class"] == "coffee"
+    assert body["severity"] == "high"  # thin coffee: no description + almost no spec attributes
     codes = {gap["code"] for gap in body["gaps"]}
-    assert {"missing_description", "missing_gtin", "missing_metafields"} <= codes
+    assert "missing_description" in codes
+    assert "spec_missing" in codes
 
     row = (
         await db.execute(select(Audit).where(Audit.id == body["audit_id"]))

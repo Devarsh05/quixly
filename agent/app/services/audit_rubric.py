@@ -1,48 +1,54 @@
-"""The deterministic product-audit rubric (Phase 3, step 1 — Gate G).
+"""The per-class product-audit rubric (Phase 3, step 1 — Gate G).
 
-Pure rule checks over a product's catalog fields — **no LLM, no DB, no network**, so the same
+Pure rule checks over a product's catalog fields — **no LLM, no DB, no network** — so the same
 product always yields the same gaps and severity. This is the Diagnostician's signal on a store
-with zero AI-recommendation wins (dev-store ``our_rate`` = 0.0): it judges each product against an
-absolute AI-legibility rubric, not a relative competitor diff (that evidence join is Phase 4).
+with zero AI-recommendation wins (dev-store ``our_rate`` = 0.0): an absolute AI-legibility rubric,
+not a relative competitor diff (that evidence join is Phase 4).
 
-**The spec vocabulary is grounded, not invented.** Every attribute family below is one the
-competitor / cited pages in run 75 organise their recommendations around — roast level, origin,
-process, variety, tasting notes, altitude, and brew-method suitability (observed in run 75's
-``engine_runs.cited_sources_json`` titles + snippets). A product an AI shopping engine can reason
-about carries these; the audit flags the ones absent from the product's own text.
+**The rubric is per product class** (``coffee`` / ``equipment`` / ``other``), classified from
+merchant data by ``services.catalog.classify_product`` — never inferred by a model.
 
-Presence is a normalised substring match (via ``services.matching.normalize_text``) over the
-product's searchable text — title + description + every metafield value — so an attribute stated
-in a structured metafield counts just as much as one written in prose.
+* **Spec scoring** (roast level, origin, process, variety, tasting notes, altitude, brew method)
+  applies to ``coffee`` only. The vocabulary is anchored to the attributes the competitor pages
+  cited in run 75 actually carry. ``equipment`` has **no** grounded vocabulary — run 75's panel is
+  coffee-bean buyer queries, so there are no cited equipment pages to anchor one — and ``other`` is
+  unknown, so neither is spec-scored (``spec_coverage`` is ``None``, never a misleading ``0.0``).
+* **GTIN** is applicable to ``equipment`` only (third-party manufactured goods carry a manufacturer
+  GTIN); self-roasted coffee is GTIN-not-applicable. Presence is read from the **variant barcode**
+  via ``extract_gtin`` — the single source of truth the Optimizer also grounds on.
+* **Not-discoverable** products (draft/archived/unlisted) are **excluded** from the audit
+  population — reported separately as "not audited", never scored and banded.
+* **Metafields** are a store-level finding (computed by the caller across the population), not a
+  per-product gap — so an empty catalog no longer inflates every product's severity.
+
+Presence is a normalised substring match (``services.matching.normalize_text``) over the product's
+searchable text — title + description + every metafield value.
 """
 
 import re
 
 from pydantic import BaseModel
 
+from app.services.catalog import extract_gtin
 from app.services.matching import normalize_text
 
-# Product bodies are HTML (``descriptionHtml`` from ingest, ``body_html`` from the webhook), so
-# tags are stripped before any text test — otherwise ``<p><br></p>`` normalises to the words
-# "p br" and reads as real description text.
+# Product bodies are HTML; strip tags before any text test so ``<p><br></p>`` doesn't read as text.
 _HTML_TAG = re.compile(r"<[^>]+>")
 
 # --- Gap codes ------------------------------------------------------------------------------
 MISSING_DESCRIPTION = "missing_description"
 MISSING_GTIN = "missing_gtin"
-MISSING_METAFIELDS = "missing_metafields"
-NOT_DISCOVERABLE = "not_discoverable"
 SPEC_MISSING = "spec_missing"
 
-# Visibility states that mean the product is not surfaced in search / collections /
-# recommendations (mirrors the vocabulary normalised in services/catalog.py). ``active`` and a
-# NULL state are treated as discoverable.
+# Visibility states that exclude a product from the audit population (mirrors catalog.py). A
+# deliberately-not-live product is reported separately, not scored.
 _NOT_DISCOVERABLE_STATES = {"draft", "archived", "unlisted"}
 
+# Classes for which a check applies.
+_SPEC_SCORED_CLASSES = {"coffee"}
+_GTIN_APPLICABLE_CLASSES = {"equipment"}
+
 # --- Spec vocabulary (anchored to run-75 cited competitor pages) ----------------------------
-# family -> phrases whose normalised form, if present anywhere in the searchable text, marks the
-# family satisfied. Phrases are matched normalised (casefolded, punctuation->space), so
-# "Process: Washed" and "washed process" both hit "washed".
 SPEC_VOCABULARY: dict[str, tuple[str, ...]] = {
     "roast_level": (
         "light roast", "medium roast", "dark roast", "medium dark", "espresso roast",
@@ -77,19 +83,18 @@ SPEC_VOCABULARY: dict[str, tuple[str, ...]] = {
 }
 
 # --- Severity weighting ---------------------------------------------------------------------
-# Weighted score → band. Weights and bands are module constants so tuning is a data change, not a
-# rewrite. not_discoverable is the heaviest single gap: an invisible product cannot be
-# recommended no matter how good its data is.
+# Weighted score → band, over the DISCOVERABLE population. Weights/bands are module constants so
+# tuning is a data change. missing_gtin is heaviest per-gap so a manufactured good lacking its GTIN
+# lands at medium on its own; a coffee product with almost no spec attributes accumulates to high.
 _WEIGHTS: dict[str, int] = {
-    NOT_DISCOVERABLE: 3,
+    MISSING_GTIN: 3,
     MISSING_DESCRIPTION: 2,
-    MISSING_GTIN: 1,
-    MISSING_METAFIELDS: 1,
     SPEC_MISSING: 1,  # per missing family
 }
-# score → severity: 0 none | 1-2 low | 3-5 medium | 6+ high.
 _LOW_MAX = 2
 _MEDIUM_MAX = 5
+
+SEVERITY_NOT_AUDITED = "not_audited"
 
 
 class AuditGap(BaseModel):
@@ -101,11 +106,14 @@ class AuditGap(BaseModel):
 
 
 class AuditResult(BaseModel):
-    """The rubric's verdict for one product: gaps, a spec-coverage ratio, and a severity band."""
+    """The rubric's verdict for one product."""
 
+    audited: bool
+    product_class: str
     gaps: list[AuditGap]
-    spec_coverage: float  # families present / total families, in [0, 1]
-    severity: str  # none | low | medium | high
+    spec_coverage: float | None  # None when the class is not spec-scored or the product is excluded
+    severity: str  # none | low | medium | high | not_audited
+    excluded_reason: str | None = None
 
 
 def _metafield_values(metafields: list[dict] | None) -> list[str]:
@@ -124,7 +132,6 @@ def _searchable_text(title: str | None, body: str | None, metafields: list[dict]
 
 
 def _has_text(body: str | None) -> bool:
-    """True if ``body`` carries any human text once HTML markup is stripped."""
     if not body:
         return False
     return bool(normalize_text(_HTML_TAG.sub(" ", body)).strip())
@@ -144,51 +151,65 @@ def evaluate_product(
     *,
     title: str | None,
     body: str | None,
-    gtin: str | None,
+    variants: list[dict] | None,
     metafields: list[dict] | None,
     visibility_state: str | None,
+    product_class: str,
 ) -> AuditResult:
-    """Score one product against the AI-legibility rubric. Deterministic and side-effect-free."""
-    text = _searchable_text(title, body, metafields)
+    """Score one product against the per-class rubric. Deterministic and side-effect-free."""
+    # Population gate: deliberately-not-live products are excluded, not scored.
+    if (visibility_state or "").lower() in _NOT_DISCOVERABLE_STATES:
+        return AuditResult(
+            audited=False,
+            product_class=product_class,
+            gaps=[],
+            spec_coverage=None,
+            severity=SEVERITY_NOT_AUDITED,
+            excluded_reason="not_visible",
+        )
+
     gaps: list[AuditGap] = []
 
     if not _has_text(body):
         gaps.append(AuditGap(code=MISSING_DESCRIPTION, detail="No product description text."))
 
-    if not gtin:
+    if product_class in _GTIN_APPLICABLE_CLASSES and extract_gtin(variants or []) is None:
         gaps.append(
-            AuditGap(code=MISSING_GTIN, detail="No variant carries a barcode / GTIN.")
+            AuditGap(code=MISSING_GTIN, detail="No variant carries a manufacturer barcode / GTIN.")
         )
 
-    if not metafields:
-        gaps.append(
-            AuditGap(
-                code=MISSING_METAFIELDS,
-                detail="No structured metafields for machine-readable attributes.",
-            )
-        )
-
-    if (visibility_state or "").lower() in _NOT_DISCOVERABLE_STATES:
-        gaps.append(
-            AuditGap(
-                code=NOT_DISCOVERABLE,
-                detail=f"visibility_state={visibility_state!r} is not surfaced to shoppers.",
-            )
-        )
-
-    present = 0
-    for family, phrases in SPEC_VOCABULARY.items():
-        if any(normalize_text(phrase) in text for phrase in phrases):
-            present += 1
-        else:
-            gaps.append(
-                AuditGap(
-                    code=SPEC_MISSING,
-                    attribute=family,
-                    detail=f"No {family.replace('_', ' ')} stated in the product's text.",
+    spec_coverage: float | None = None
+    if product_class in _SPEC_SCORED_CLASSES:
+        text = _searchable_text(title, body, metafields)
+        present = 0
+        for family, phrases in SPEC_VOCABULARY.items():
+            if any(normalize_text(phrase) in text for phrase in phrases):
+                present += 1
+            else:
+                gaps.append(
+                    AuditGap(
+                        code=SPEC_MISSING,
+                        attribute=family,
+                        detail=f"No {family.replace('_', ' ')} stated in the product's text.",
+                    )
                 )
-            )
+        spec_coverage = present / len(SPEC_VOCABULARY)
 
-    spec_coverage = present / len(SPEC_VOCABULARY)
     score = sum(_WEIGHTS[gap.code] for gap in gaps)
-    return AuditResult(gaps=gaps, spec_coverage=spec_coverage, severity=_severity(score))
+    return AuditResult(
+        audited=True,
+        product_class=product_class,
+        gaps=gaps,
+        spec_coverage=spec_coverage,
+        severity=_severity(score),
+    )
+
+
+def has_structured_metafields(metafields: list[dict] | None) -> bool:
+    """True if the product carries at least one structured metafield.
+
+    Metafield coverage is a **store-level** finding (e.g. "0 of 18 discoverable products carry
+    structured metafields"), rolled up by the caller across the population — it is deliberately not
+    a per-product gap, so an empty catalog does not inflate every product's severity.
+    """
+    return bool(metafields)

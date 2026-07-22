@@ -1,36 +1,38 @@
-"""The deterministic product-audit rubric (Phase 3, step 1 — Gate G).
+"""The per-class product-audit rubric (Phase 3, step 1 — Gate G).
 
-Pure rule checks over a product's catalog fields; no DB, no LLM. The spec vocabulary is
-anchored to attributes the competitor pages cited in run 75 actually carry (roast level,
-origin, process, variety, tasting notes, altitude, brew-method suitability) — not invented
-thresholds. Each gap branch is seeded distinctly so a regression in one check can't hide
-behind another.
+Pure, deterministic rule checks. The rubric is **per product class**:
+
+* spec scoring (roast/origin/process/variety/tasting notes/altitude/brew method) applies to
+  ``coffee`` only — the vocabulary is anchored to run-75's cited coffee-bean pages. ``equipment``
+  has no grounded vocabulary (run 75's panel is coffee-bean queries, so no cited equipment pages),
+  so equipment is NOT spec-scored; ``other`` is skipped too.
+* ``missing_gtin`` applies only to ``equipment`` (third-party manufactured goods carry a
+  manufacturer GTIN); self-roasted coffee is GTIN-not-applicable. GTIN presence is read from the
+  variant barcode — the single source of truth shared with the Optimizer.
+* not-discoverable products (draft/archived/unlisted) are EXCLUDED from the audit population and
+  reported separately — not scored and banded.
+* ``missing_metafields`` is a store-level finding, NOT a per-product gap, so it no longer inflates
+  per-product severity.
+
+Each branch is seeded distinctly.
 """
 
 from app.services.audit_rubric import (
     MISSING_DESCRIPTION,
     MISSING_GTIN,
-    MISSING_METAFIELDS,
-    NOT_DISCOVERABLE,
     SPEC_MISSING,
     evaluate_product,
 )
 
-# A product that carries every spec family in prose, plus a structured metafield, a GTIN,
-# a description, and an active (discoverable) status. The rubric should find nothing.
 RICH_BODY = (
-    "Single-origin washed Arabica from Ethiopia. Altitude 1,900-2,100 masl. "
-    "Varietal: Heirloom. Process: washed, 36-hour fermentation. Roast level: light "
-    "(Agtron 68). Tasting notes: bergamot, jasmine, stone fruit. Brews beautifully as "
-    "pour over or espresso."
+    "Single-origin washed Arabica from Ethiopia. Altitude 1,900-2,100 masl. Varietal: Heirloom. "
+    "Process: washed, 36-hour fermentation. Roast level: light (Agtron 68). Tasting notes: "
+    "bergamot, jasmine, stone fruit. Brews beautifully as pour over or espresso."
 )
 
 
-def _meta(*pairs: tuple[str, str]) -> list[dict]:
-    return [
-        {"namespace": "custom", "key": k, "value": v, "type": "single_line_text_field"}
-        for k, v in pairs
-    ]
+def _variants(barcode: str | None = "0123456789012") -> list[dict]:
+    return [{"id": "gid://shopify/Variant/1", "barcode": barcode}]
 
 
 def _codes(result) -> set[str]:
@@ -41,172 +43,164 @@ def _spec_attrs(result) -> set[str]:
     return {gap.attribute for gap in result.gaps if gap.code == SPEC_MISSING}
 
 
-def test_fully_optimized_product_has_no_gaps_and_none_severity():
-    result = evaluate_product(
-        title="Ethiopia Yirgacheffe 340 g",
+def _coffee(**overrides):
+    kwargs = dict(
+        title="Ethiopia Yirgacheffe",
         body=RICH_BODY,
-        gtin="0123456789012",
-        metafields=_meta(("roast", "light")),
+        variants=_variants(None),  # coffee GTIN is not applicable, so barcode is irrelevant
+        metafields=None,
         visibility_state="active",
+        product_class="coffee",
     )
+    kwargs.update(overrides)
+    return evaluate_product(**kwargs)
+
+
+def _equipment(**overrides):
+    kwargs = dict(
+        title="Conical Burr Grinder",
+        body="A great grinder.",
+        variants=_variants("0123456789012"),
+        metafields=None,
+        visibility_state="active",
+        product_class="equipment",
+    )
+    kwargs.update(overrides)
+    return evaluate_product(**kwargs)
+
+
+# --- coffee ---------------------------------------------------------------------------------
+def test_fully_optimized_coffee_has_no_gaps():
+    result = _coffee()
+    assert result.audited is True
     assert result.gaps == []
     assert result.severity == "none"
     assert result.spec_coverage == 1.0
 
 
-def test_blank_description_flags_missing_description():
-    result = evaluate_product(
-        title="Kenya AA",
-        body="   ",
-        gtin="0123456789012",
-        metafields=_meta(("roast", "light")),
-        visibility_state="active",
-    )
-    assert MISSING_DESCRIPTION in _codes(result)
-
-
-def test_html_only_description_counts_as_missing():
-    # The ingest stores descriptionHtml; a body that is only markup carries no text.
-    result = evaluate_product(
-        title="Kenya AA",
-        body="<p><br></p>",
-        gtin="0123456789012",
-        metafields=_meta(("roast", "light")),
-        visibility_state="active",
-    )
-    assert MISSING_DESCRIPTION in _codes(result)
-
-
-def test_absent_gtin_flags_missing_gtin():
-    result = evaluate_product(
-        title="Colombia Huila",
-        body=RICH_BODY,
-        gtin=None,
-        metafields=_meta(("roast", "light")),
-        visibility_state="active",
-    )
-    assert MISSING_GTIN in _codes(result)
-
-
-def test_empty_metafields_flags_missing_metafields():
-    for metafields in (None, []):
-        result = evaluate_product(
-            title="Colombia Huila",
-            body=RICH_BODY,
-            gtin="0123456789012",
-            metafields=metafields,
-            visibility_state="active",
-        )
-        assert MISSING_METAFIELDS in _codes(result)
-
-
-def test_non_active_visibility_flags_not_discoverable():
-    for state in ("draft", "archived", "unlisted"):
-        result = evaluate_product(
-            title="House Blend",
-            body=RICH_BODY,
-            gtin="0123456789012",
-            metafields=_meta(("roast", "light")),
-            visibility_state=state,
-        )
-        assert NOT_DISCOVERABLE in _codes(result), state
-
-
-def test_active_and_null_visibility_are_discoverable():
-    for state in ("active", None):
-        result = evaluate_product(
-            title="House Blend",
-            body=RICH_BODY,
-            gtin="0123456789012",
-            metafields=_meta(("roast", "light")),
-            visibility_state=state,
-        )
-        assert NOT_DISCOVERABLE not in _codes(result), state
-
-
-def test_missing_single_spec_attribute_is_flagged_precisely():
-    # RICH_BODY minus any brew-method language: exactly one spec family should be missing.
+def test_coffee_missing_one_spec_family_is_flagged_precisely():
     body = (
-        "Single-origin washed Arabica from Ethiopia. Altitude 1,900-2,100 masl. "
-        "Varietal: Heirloom. Process: washed. Roast level: light. "
-        "Tasting notes: bergamot, jasmine."
-    )
-    result = evaluate_product(
-        title="Ethiopia Yirgacheffe",
-        body=body,
-        gtin="0123456789012",
-        metafields=_meta(("roast", "light")),
-        visibility_state="active",
-    )
+        "Single-origin washed Arabica from Ethiopia. Altitude 2,000 masl. Varietal: Heirloom. "
+        "Process: washed. Roast level: light. Tasting notes: bergamot."
+    )  # no brew-method language
+    result = _coffee(body=body)
     assert _spec_attrs(result) == {"brew_method"}
+    assert result.spec_coverage == 6 / 7
 
 
-def test_spec_attribute_satisfied_by_metafield_not_only_body():
-    # A thin body but the attribute is carried in a metafield value — still counts as present.
-    result = evaluate_product(
-        title="Ethiopia Yirgacheffe",
+def test_coffee_blank_body_flags_missing_description():
+    assert MISSING_DESCRIPTION in _codes(_coffee(body="<p><br></p>"))
+
+
+def test_coffee_never_gets_missing_gtin_even_without_a_barcode():
+    # Self-roasted coffee is GTIN-not-applicable — no barcode is not a gap.
+    result = _coffee(variants=_variants(None))
+    assert MISSING_GTIN not in _codes(result)
+
+
+def test_spec_attribute_can_be_satisfied_by_a_metafield():
+    result = _coffee(
         body="A lovely coffee.",
-        gtin="0123456789012",
-        metafields=_meta(
-            ("roast", "medium roast"),
-            ("origin", "single-origin Ethiopia"),
-            ("process", "washed"),
-            ("variety", "Heirloom varietal"),
-            ("notes", "tasting notes: bergamot, jasmine"),
-            ("altitude", "2000 masl"),
-            ("brew", "pour over and espresso"),
-        ),
-        visibility_state="active",
+        metafields=[
+            {"key": "roast", "value": "medium roast"},
+            {"key": "origin", "value": "single-origin Ethiopia"},
+            {"key": "process", "value": "washed"},
+            {"key": "variety", "value": "Heirloom varietal"},
+            {"key": "notes", "value": "tasting notes: bergamot"},
+            {"key": "altitude", "value": "2000 masl"},
+            {"key": "brew", "value": "pour over and espresso"},
+        ],
     )
     assert _spec_attrs(result) == set()
 
 
-def test_empty_product_is_high_severity_with_all_spec_families_missing():
-    result = evaluate_product(
-        title="Mystery Beans",
-        body=None,
-        gtin=None,
-        metafields=None,
-        visibility_state="active",
-    )
-    assert result.severity == "high"
-    assert MISSING_DESCRIPTION in _codes(result)
+# --- equipment ------------------------------------------------------------------------------
+def test_equipment_is_not_spec_scored():
+    result = _equipment(body="")  # nothing coffee-ish at all
+    assert result.spec_coverage is None
+    assert not any(g.code == SPEC_MISSING for g in result.gaps)
+
+
+def test_equipment_without_a_barcode_flags_missing_gtin():
+    result = _equipment(variants=_variants(None))
     assert MISSING_GTIN in _codes(result)
-    assert MISSING_METAFIELDS in _codes(result)
-    # All seven spec families are absent from an empty product.
-    assert _spec_attrs(result) == {
-        "roast_level",
-        "origin",
-        "process",
-        "variety",
-        "tasting_notes",
-        "altitude",
-        "brew_method",
-    }
+
+
+def test_equipment_with_a_barcode_has_no_gtin_gap():
+    result = _equipment(variants=_variants("0123456789012"))
+    assert MISSING_GTIN not in _codes(result)
+
+
+# --- other / unset --------------------------------------------------------------------------
+def test_other_class_is_not_spec_scored_and_has_no_gtin_gap():
+    result = evaluate_product(
+        title="Gift Card", body="", variants=_variants(None), metafields=None,
+        visibility_state="active", product_class="other",
+    )
+    assert result.spec_coverage is None
+    assert MISSING_GTIN not in _codes(result)
+    assert not any(g.code == SPEC_MISSING for g in result.gaps)
+
+
+# --- discoverability (population gate) -------------------------------------------------------
+def test_draft_archived_unlisted_are_excluded_not_scored():
+    for state in ("draft", "archived", "unlisted"):
+        result = _coffee(visibility_state=state, body=None, variants=_variants(None))
+        assert result.audited is False, state
+        assert result.excluded_reason == "not_visible"
+        assert result.severity == "not_audited"
+        assert result.gaps == []
+        assert result.spec_coverage is None
+
+
+def test_active_and_null_visibility_are_audited():
+    for state in ("active", None):
+        assert _coffee(visibility_state=state).audited is True
+
+
+# --- metafields are store-level, never a per-product gap ------------------------------------
+def test_empty_metafields_never_produce_a_per_product_gap():
+    result = _coffee(metafields=None)
+    assert "missing_metafields" not in _codes(result)
+    result2 = _equipment(metafields=[])
+    assert "missing_metafields" not in _codes(result2)
+
+
+# --- severity banding -----------------------------------------------------------------------
+def test_empty_coffee_is_high():
+    # A spec-neutral title so nothing (not even origin from "Ethiopia") is picked up.
+    result = _coffee(title="Mystery Beans", body=None)
+    # missing_description (2) + 7 spec_missing (7) = 9 -> high
+    assert result.severity == "high"
     assert result.spec_coverage == 0.0
 
 
-def test_not_discoverable_alone_lands_at_least_medium():
-    # A near-perfect product that is merely set to draft is still a real problem.
-    result = evaluate_product(
-        title="House Blend",
-        body=RICH_BODY,
-        gtin="0123456789012",
-        metafields=_meta(("roast", "light")),
-        visibility_state="draft",
-    )
-    assert _codes(result) == {NOT_DISCOVERABLE}
+def test_coffee_with_five_missing_specs_is_medium():
+    # 2 families present, 5 missing -> score 5 -> medium.
+    body = "Medium roast, single-origin Ethiopia."
+    result = _coffee(body=body)
+    assert result.spec_coverage == 2 / 7
     assert result.severity == "medium"
 
 
-def test_result_is_deterministic():
-    kwargs = dict(
-        title="Colombia Huila",
-        body="Medium roast from Colombia.",
-        gtin=None,
-        metafields=None,
-        visibility_state="active",
+def test_coffee_with_one_missing_spec_is_low():
+    body = (
+        "Single-origin washed Arabica from Ethiopia. Altitude 2,000 masl. Varietal: Heirloom. "
+        "Process: washed. Roast level: light. Tasting notes: bergamot."
     )
-    first = evaluate_product(**kwargs)
-    second = evaluate_product(**kwargs)
-    assert first.model_dump() == second.model_dump()
+    assert _coffee(body=body).severity == "low"
+
+
+def test_equipment_missing_gtin_is_medium():
+    # missing_gtin weight is 3, so a manufactured good with no GTIN lands at medium.
+    assert _equipment(variants=_variants(None)).severity == "medium"
+
+
+def test_equipment_complete_is_none():
+    assert _equipment(variants=_variants("0123456789012")).severity == "none"
+
+
+def test_result_is_deterministic():
+    a = _coffee(body="Medium roast from Colombia.")
+    b = _coffee(body="Medium roast from Colombia.")
+    assert a.model_dump() == b.model_dump()
