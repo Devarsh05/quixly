@@ -29,7 +29,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Audit, Fix, FixStatus, FixType, Product
-from app.services.audit_rubric import SEVERITY_NOT_AUDITED
+from app.services.audit_rubric import SEVERITY_NOT_AUDITED, validate_spec_value
 from app.services.matching import is_grounded
 from app.services.optimizer_llm import AttributeCandidate, OptimizerClient
 
@@ -38,11 +38,17 @@ _METAFIELD_NAMESPACE = "custom"
 
 
 class DroppedCandidate(BaseModel):
-    """A candidate the model proposed but the guard dropped (not literally in source)."""
+    """A candidate a guard dropped, with which guard fired.
+
+    ``reason``: ``fabrication`` — value/snippet was not literally in source (anti-hallucination);
+    ``mis_assignment`` — the value was literally present but is not valid for the target family
+    (e.g. a process term grounded as a brew_method). Either way the gap stays unfilled → a to-do.
+    """
 
     attribute: str
     value: str
     source_field: str | None
+    reason: str
 
 
 class OptimizerReport(BaseModel):
@@ -180,17 +186,26 @@ async def run_optimizer(
     for candidate in candidates:
         if candidate.attribute not in spec_targets or candidate.attribute in grounded:
             continue
-        if ground_attribute(candidate, source_fields) is not None:
-            grounded[candidate.attribute] = candidate
-        elif candidate.value is not None and not candidate.ambiguous:
-            # The model asserted a value that did not literally ground — the guard drops it.
+        value = ground_attribute(candidate, source_fields)
+        if value is None:
+            if candidate.value is not None and not candidate.ambiguous:
+                # Asserted a value that is not literally in source — anti-hallucination drop.
+                dropped.append(
+                    DroppedCandidate(
+                        attribute=candidate.attribute, value=candidate.value,
+                        source_field=candidate.source_field, reason="fabrication",
+                    )
+                )
+        elif not validate_spec_value(candidate.attribute, value, candidate.snippet or ""):
+            # Literally present, but not valid for THIS family — mis-assignment drop.
             dropped.append(
                 DroppedCandidate(
-                    attribute=candidate.attribute,
-                    value=candidate.value,
-                    source_field=candidate.source_field,
+                    attribute=candidate.attribute, value=value,
+                    source_field=candidate.source_field, reason="mis_assignment",
                 )
             )
+        else:
+            grounded[candidate.attribute] = candidate
 
     fixes: list[Fix] = []
 

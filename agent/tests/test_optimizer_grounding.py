@@ -16,6 +16,7 @@ plus explicit hallucination cases (value or snippet not in source → refused).
 import pytest
 
 from app.graph.optimizer import ground_attribute
+from app.services.audit_rubric import validate_spec_value
 from app.services.optimizer_llm import AttributeCandidate
 
 # (family, a plainly-stated value, prose that literally contains it)
@@ -80,3 +81,57 @@ def test_unknown_source_field_is_refused():
         snippet="light", ambiguous=False,
     )
     assert ground_attribute(cand, {"body_html": "Roast level: light"}) is None
+
+
+# --- Positive validation: a grounded value must be valid FOR the target family ---------------
+# At a ~1.6% fill rate, over-strictness is invisible in aggregate — so assert that LEGITIMATE
+# values (including compound / variant phrasings) still pass.
+LEGITIMATE = [
+    ("roast_level", "light", ""),
+    ("roast_level", "medium-light", ""),
+    ("roast_level", "Medium-Light", ""),
+    ("roast_level", "dark", ""),
+    ("process", "washed", ""),
+    ("process", "natural", ""),
+    ("process", "honey", ""),
+    ("brew_method", "pour over", ""),
+    ("brew_method", "espresso", ""),
+    ("brew_method", "cold brew", ""),
+    ("variety", "Heirloom", ""),
+    ("variety", "Gesha", ""),
+    ("origin", "Ethiopia", ""),
+    ("origin", "Ethiopia, Yirgacheffe", ""),
+    ("origin", "Costa Rica", ""),
+    ("altitude", "1,800 masl", ""),
+    ("altitude", "1800m", ""),
+    ("altitude", "2000 metres", ""),
+    ("tasting_notes", "bergamot", "Tasting notes: bergamot, jasmine"),
+]
+
+
+@pytest.mark.parametrize("family,value,snippet", LEGITIMATE)
+def test_legitimate_values_validate(family, value, snippet):
+    assert validate_spec_value(family, value, snippet) is True
+
+
+# --- Mis-assignment: a real source token grounded onto the WRONG family must be refused --------
+MIS_ASSIGNED = [
+    ("brew_method", "Washed", "Process: Washed"),   # the observed defect (process → brew_method)
+    ("altitude", "340", "Ethiopia Yirgacheffe 340 g"),  # a weight → altitude
+    ("altitude", "340 g", "340 g net weight"),
+    ("altitude", "500", "500 reviews"),
+    ("roast_level", "washed", "washed"),
+    ("process", "pour over", "pour over"),
+    ("variety", "washed", "washed"),
+    ("origin", "washed", "washed"),
+]
+
+
+@pytest.mark.parametrize("family,value,snippet", MIS_ASSIGNED)
+def test_mis_assigned_values_are_refused(family, value, snippet):
+    assert validate_spec_value(family, value, snippet) is False
+
+
+def test_open_family_refuses_a_competing_label_snippet():
+    # A tasting-notes candidate whose snippet is actually a process statement (competing label).
+    assert validate_spec_value("tasting_notes", "washed", "Process: washed") is False

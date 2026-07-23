@@ -136,6 +136,27 @@ async def test_hallucinated_candidate_is_dropped_not_emitted(db, shop):
     assert all(f.type == FixType.merchant_todo for f in fixes)
     assert not any((f.after_json or {}).get("value") == "dark" for f in fixes)
     assert report.dropped and report.dropped[0].value == "dark"
+    assert report.dropped[0].reason == "fabrication"
+
+
+async def test_mis_assigned_value_is_dropped_and_gap_still_becomes_a_todo(db, shop):
+    # The observed defect: "washed" is literally in the body (a process term) but the model
+    # grounds it onto brew_method. Present in source, invalid for the family → mis-assignment.
+    body = "Single-origin washed Arabica. Process: washed."
+    product = await _seed(db, shop.id, gaps=[_gap("spec_missing", "brew_method")], body=body)
+    client = ScriptedOptimizerClient(
+        [AttributeCandidate(attribute="brew_method", value="washed", source_field="body_html",
+                            snippet="Process: washed", ambiguous=False)]
+    )
+
+    report = await run_optimizer(db, product.id, client)
+
+    fixes = await _fixes(db, product.id)
+    # No metafield fix; the gap did NOT vanish — it is a merchant to-do.
+    assert [f.type for f in fixes] == [FixType.merchant_todo]
+    assert fixes[0].target == "spec:brew_method"
+    assert report.fillable == 0 and report.todos == 1
+    assert report.dropped and report.dropped[0].reason == "mis_assignment"
 
 
 async def test_missing_gtin_is_always_a_todo_and_never_carries_a_barcode(db, shop):

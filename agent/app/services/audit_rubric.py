@@ -49,38 +49,156 @@ _SPEC_SCORED_CLASSES = {"coffee"}
 _GTIN_APPLICABLE_CLASSES = {"equipment"}
 
 # --- Spec vocabulary (anchored to run-75 cited competitor pages) ----------------------------
-SPEC_VOCABULARY: dict[str, tuple[str, ...]] = {
-    "roast_level": (
-        "light roast", "medium roast", "dark roast", "medium dark", "espresso roast",
-        "roast level", "agtron", "decaf", "light medium roast",
+# ONE definition, two consumers (CLAUDE.md "one normalizer"): the rubric reads ``.detect`` (family
+# mentioned at all?) exactly as before; the Optimizer reads the validation fields (``kind`` +
+# ``values`` / ``pattern`` / ``labels``) to POSITIVELY validate that an extracted value is valid
+# *for its target family* — not merely present in source. Three family kinds:
+#   * closed  — value must be a member of the family's value vocabulary (catches "washed" as a
+#               brew_method: "washed" is not a brew value).
+#   * format  — value must match a numeric + elevation-unit pattern (catches altitude:="340"
+#               grounded from a weight/bare number).
+#   * open    — the citation snippet must carry the family's OWN label and no competing family's
+#               label (for open-ended descriptors like tasting notes).
+# ``detect`` tuples are byte-for-byte the old SPEC_VOCABULARY, so rubric detection is unchanged.
+
+# A number followed by an elevation unit (masl / m / ft / meters). "340 g" (a weight) and a bare
+# "340" do not match. ``search`` so a range like "1,900-2,100 masl" still validates.
+_ALTITUDE_RE = re.compile(
+    r"\d[\d,.\s]*(masl|m\.?a\.?s\.?l\.?|met(?:er|re)s?|feet|ft|m)\b", re.IGNORECASE
+)
+
+
+class SpecFamily(BaseModel):
+    """One spec family's detection phrases (rubric) + positive-validation rules (Optimizer)."""
+
+    detect: tuple[str, ...]
+    kind: str  # "closed" | "format" | "open"
+    values: tuple[str, ...] = ()  # closed: valid value phrases (word-boundary matched)
+    labels: tuple[str, ...] = ()  # the family's own label terms (open uses these + competitors')
+
+
+SPEC_FAMILIES: dict[str, SpecFamily] = {
+    "roast_level": SpecFamily(
+        detect=(
+            "light roast", "medium roast", "dark roast", "medium dark", "espresso roast",
+            "roast level", "agtron", "decaf", "light medium roast",
+        ),
+        kind="closed",
+        values=("light", "medium", "dark", "espresso", "decaf", "blonde", "cinnamon", "french"),
+        labels=("roast level", "roast", "agtron"),
     ),
-    "origin": (
-        "single origin", "single-origin", "ethiopia", "colombia", "kenya", "guatemala",
-        "costa rica", "brazil", "sumatra", "tanzania", "el salvador", "honduras", "rwanda",
-        "peru", "yirgacheffe", "huila",
+    "origin": SpecFamily(
+        detect=(
+            "single origin", "single-origin", "ethiopia", "colombia", "kenya", "guatemala",
+            "costa rica", "brazil", "sumatra", "tanzania", "el salvador", "honduras", "rwanda",
+            "peru", "yirgacheffe", "huila",
+        ),
+        kind="closed",
+        values=(
+            "ethiopia", "colombia", "kenya", "guatemala", "costa rica", "brazil", "sumatra",
+            "tanzania", "el salvador", "honduras", "rwanda", "peru", "yirgacheffe", "huila",
+            "panama", "panamá", "nicaragua", "mexico", "burundi", "yemen", "india", "uganda",
+            "bolivia", "ecuador", "jamaica", "indonesia", "java",
+        ),
+        labels=("origin", "single-origin", "single origin"),
     ),
-    "process": (
-        "washed", "process", "fermentation", "honey process", "natural process",
-        "naturally processed", "anaerobic", "semi washed", "wet hulled", "black honey",
+    "process": SpecFamily(
+        detect=(
+            "washed", "process", "fermentation", "honey process", "natural process",
+            "naturally processed", "anaerobic", "semi washed", "wet hulled", "black honey",
+        ),
+        kind="closed",
+        values=(
+            "washed", "natural", "honey", "anaerobic", "semi washed", "wet hulled", "pulped",
+            "black honey", "red honey", "white honey", "carbonic", "dry",
+        ),
+        labels=("process", "fermentation"),
     ),
-    "variety": (
-        "varietal", "variety", "heirloom", "gesha", "geisha", "bourbon", "typica", "caturra",
-        "catuai", "sl28", "sl34", "peaberry", "pacamara", "mundo novo",
+    "variety": SpecFamily(
+        detect=(
+            "varietal", "variety", "heirloom", "gesha", "geisha", "bourbon", "typica", "caturra",
+            "catuai", "sl28", "sl34", "peaberry", "pacamara", "mundo novo",
+        ),
+        kind="closed",
+        values=(
+            "heirloom", "gesha", "geisha", "bourbon", "typica", "caturra", "catuai", "sl28",
+            "sl34", "peaberry", "pacamara", "mundo novo", "maragogipe", "villa sarchi", "castillo",
+        ),
+        labels=("varietal", "variety", "cultivar"),
     ),
-    "tasting_notes": (
-        "tasting notes", "notes of", "flavor notes", "flavour notes", "bergamot", "jasmine",
-        "chocolate", "cocoa", "caramel", "citrus", "berry", "floral", "fruity", "nutty",
-        "stone fruit", "blackcurrant",
+    "tasting_notes": SpecFamily(
+        detect=(
+            "tasting notes", "notes of", "flavor notes", "flavour notes", "bergamot", "jasmine",
+            "chocolate", "cocoa", "caramel", "citrus", "berry", "floral", "fruity", "nutty",
+            "stone fruit", "blackcurrant",
+        ),
+        kind="open",
+        labels=("tasting notes", "notes of", "flavor notes", "flavour notes", "tasting note",
+                "aroma", "notes"),
     ),
-    "altitude": (
-        "altitude", "masl", "m a s l", "elevation", "meters above", "metres above",
-        "high grown", "high altitude", "grown at",
+    "altitude": SpecFamily(
+        detect=(
+            "altitude", "masl", "m a s l", "elevation", "meters above", "metres above",
+            "high grown", "high altitude", "grown at",
+        ),
+        kind="format",
+        labels=("altitude", "elevation", "masl", "grown at"),
     ),
-    "brew_method": (
-        "pour over", "pour-over", "espresso", "cold brew", "french press", "drip", "aeropress",
-        "moka", "filter coffee",
+    "brew_method": SpecFamily(
+        detect=(
+            "pour over", "pour-over", "espresso", "cold brew", "french press", "drip", "aeropress",
+            "moka", "filter coffee",
+        ),
+        kind="closed",
+        values=(
+            "pour over", "pour-over", "espresso", "cold brew", "french press", "drip", "aeropress",
+            "moka", "filter", "immersion", "percolator", "chemex", "v60", "batch brew",
+        ),
+        labels=("brew method", "brewing", "brew"),
     ),
 }
+
+# Derived view for the rubric — the detection phrases, exactly as before. Do NOT hand-edit; it is
+# the single SPEC_FAMILIES definition projected.
+SPEC_VOCABULARY: dict[str, tuple[str, ...]] = {
+    family: spec.detect for family, spec in SPEC_FAMILIES.items()
+}
+
+
+def _contains_term(term: str, text: str) -> bool:
+    """True if ``term`` appears as a whole word/phrase (not a substring) in ``text``, normalized."""
+    words = normalize_text(text).split()
+    term_words = normalize_text(term).split()
+    if not term_words:
+        return False
+    span = len(term_words)
+    return any(words[i : i + span] == term_words for i in range(len(words) - span + 1))
+
+
+def validate_spec_value(family: str, value: str, snippet: str) -> bool:
+    """Positively validate that ``value`` is valid FOR ``family`` (not merely present in source).
+
+    The second grounding gate, after literal presence: it catches mis-assignment — a real source
+    token grounded onto the wrong attribute (e.g. the process term "washed" proposed as a
+    brew_method, or a weight "340" proposed as an altitude).
+    """
+    spec = SPEC_FAMILIES.get(family)
+    if spec is None:
+        return False
+    if spec.kind == "closed":
+        return any(_contains_term(v, value) for v in spec.values)
+    if spec.kind == "format":
+        return bool(_ALTITUDE_RE.search(value or ""))
+    if spec.kind == "open":
+        own = any(_contains_term(label, snippet) for label in spec.labels)
+        competing = any(
+            _contains_term(label, snippet)
+            for other, other_spec in SPEC_FAMILIES.items()
+            if other != family
+            for label in other_spec.labels
+        )
+        return own and not competing
+    return False
 
 # --- Severity weighting ---------------------------------------------------------------------
 # Weighted score → band, over the DISCOVERABLE population. Weights/bands are module constants so
