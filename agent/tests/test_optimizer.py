@@ -157,6 +157,26 @@ async def test_mis_assigned_value_is_dropped_and_gap_still_becomes_a_todo(db, sh
     assert fixes[0].target == "spec:brew_method"
     assert report.fillable == 0 and report.todos == 1
     assert report.dropped and report.dropped[0].reason == "mis_assignment"
+    # The distinction is PERSISTED, not only in the in-memory report — and truthful (not "not
+    # stated"): the value was found, it just didn't validate.
+    todo = fixes[0]
+    assert "did not validate as brew method" in todo.reason
+    assert "not stated" not in todo.reason
+    assert todo.source_json[0]["drop_reason"] == "mis_assignment"
+    assert todo.source_json[0]["rejected_value"] == "washed"
+    assert todo.source_json[0]["source_field"] == "body_html"
+
+
+async def test_absent_todo_keeps_the_plain_reason_and_no_source_json(db, shop):
+    product = await _seed(db, shop.id, gaps=[_gap("spec_missing", "altitude")], body="A coffee.")
+    client = ScriptedOptimizerClient(
+        [AttributeCandidate(attribute="altitude", value=None, source_field=None, snippet=None,
+                            ambiguous=False)]
+    )
+    await run_optimizer(db, product.id, client)
+    todo = (await _fixes(db, product.id))[0]
+    assert "No altitude stated in any source field" in todo.reason
+    assert todo.source_json is None
 
 
 async def test_missing_gtin_is_always_a_todo_and_never_carries_a_barcode(db, shop):
@@ -174,25 +194,43 @@ async def test_missing_gtin_is_always_a_todo_and_never_carries_a_barcode(db, sho
     assert all(f.type == FixType.merchant_todo for f in fixes)
 
 
-async def test_description_gap_with_grounded_attrs_yields_a_grounded_rewrite(db, shop):
-    body = "Roast level: light. Single-origin Ethiopia."
-    product = await _seed(
-        db, shop.id,
-        gaps=[_gap("missing_description"), _gap("spec_missing", "roast_level")],
-        body=body,
-    )
+async def test_body_only_grounded_yields_metafield_but_no_description(db, shop):
+    # The value was extracted FROM the body — appending it back into the body is redundant.
+    body = "Roast: light."
+    product = await _seed(db, shop.id, gaps=[_gap("spec_missing", "roast_level")], body=body)
     client = ScriptedOptimizerClient(
         [AttributeCandidate(attribute="roast_level", value="light", source_field="body_html",
-                            snippet="Roast level: light", ambiguous=False)]
+                            snippet="Roast: light", ambiguous=False)]
+    )
+
+    await run_optimizer(db, product.id, client)
+
+    types = [f.type for f in await _fixes(db, product.id)]
+    assert FixType.metafield in types      # the valuable half still fires
+    assert FixType.description not in types  # no redundant re-append
+
+
+async def test_non_body_grounded_yields_metafield_and_description(db, shop):
+    # roast is a gap; the value lives in variants_json (a non-body source) — so surfacing it into
+    # the description adds information the prose lacks.
+    product = await _seed(
+        db, shop.id, gaps=[_gap("spec_missing", "roast_level")],
+        body="A nice coffee.", variants=[{"title": "Roast: Medium-Light"}],
+    )
+    client = ScriptedOptimizerClient(
+        [AttributeCandidate(attribute="roast_level", value="Medium-Light",
+                            source_field="variants_json", snippet="Roast: Medium-Light",
+                            ambiguous=False)]
     )
 
     await run_optimizer(db, product.id, client)
 
     fixes = await _fixes(db, product.id)
+    assert len([f for f in fixes if f.type == FixType.metafield]) == 1
     desc = [f for f in fixes if f.type == FixType.description]
     assert len(desc) == 1
-    # Every attribute value surfaced in the rewrite is grounded (present in source).
-    assert "light" in desc[0].after_json["body_html"]
+    assert desc[0].after_json["body_html"].startswith("A nice coffee.")  # prose untouched
+    assert "Medium-Light" in desc[0].after_json["body_html"]
 
 
 async def test_run_id_is_stamped(db, shop):

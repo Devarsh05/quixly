@@ -35,6 +35,9 @@ from app.services.optimizer_llm import AttributeCandidate, OptimizerClient
 
 _HTML_TAG = re.compile(r"<[^>]+>")
 _METAFIELD_NAMESPACE = "custom"
+# A description fix only fires for attributes grounded from a NON-body source — appending a spec
+# extracted from the body back into the body would be redundant (and Step 4 publishes it live).
+_NON_BODY_SOURCES = {"variants_json", "metafields", "product_type"}
 
 
 class DroppedCandidate(BaseModel):
@@ -132,11 +135,27 @@ def _citation(attribute: str, candidate: AttributeCandidate) -> dict:
 
 
 def _compose_description(body: str | None, grounded: dict[str, AttributeCandidate]) -> str:
-    """Compose a spec-dense description from grounded attributes only (no new claims)."""
+    """Compose a spec-dense description by APPENDING grounded specs; existing prose is untouched."""
     base = _strip_html(body).strip()
     lines = [f"- {attr.replace('_', ' ').title()}: {cand.value}" for attr, cand in grounded.items()]
     details = "Details:\n" + "\n".join(lines)
     return f"{base}\n\n{details}" if base else details
+
+
+def _todo_reason(
+    attribute: str, drop_reason: str, value: str | None, source_field: str | None
+) -> str:
+    """Merchant-facing reason for an unfilled spec gap — truthful about WHY it is unfilled."""
+    family = attribute.replace("_", " ")
+    if drop_reason == "mis_assignment":
+        return (
+            f"A value ({value!r}) was found in {source_field} but did not validate as {family}; "
+            f"a merchant must add a valid {family}."
+        )
+    if drop_reason == "fabrication":
+        # Merchant-facing: never expose what the model proposed.
+        return f"No verified {family} was found in your product data; a merchant must add it."
+    return f"No {family} stated in any source field; a merchant must add it."
 
 
 async def run_optimizer(
@@ -183,6 +202,9 @@ async def run_optimizer(
 
     grounded: dict[str, AttributeCandidate] = {}
     dropped: list[DroppedCandidate] = []
+    # Per-attribute unfillability, so the persisted to-do can say WHY (queryable, not only in the
+    # in-memory report): attribute -> (drop_reason, rejected_value, source_field).
+    unfillable: dict[str, tuple[str, str | None, str | None]] = {}
     for candidate in candidates:
         if candidate.attribute not in spec_targets or candidate.attribute in grounded:
             continue
@@ -196,6 +218,9 @@ async def run_optimizer(
                         source_field=candidate.source_field, reason="fabrication",
                     )
                 )
+                unfillable[candidate.attribute] = (
+                    "fabrication", candidate.value, candidate.source_field
+                )
         elif not validate_spec_value(candidate.attribute, value, candidate.snippet or ""):
             # Literally present, but not valid for THIS family — mis-assignment drop.
             dropped.append(
@@ -203,6 +228,9 @@ async def run_optimizer(
                     attribute=candidate.attribute, value=value,
                     source_field=candidate.source_field, reason="mis_assignment",
                 )
+            )
+            unfillable[candidate.attribute] = (
+                "mis_assignment", value, candidate.source_field
             )
         else:
             grounded[candidate.attribute] = candidate
@@ -228,44 +256,60 @@ async def run_optimizer(
                 )
             )
         else:
+            drop_reason, rejected_value, rejected_field = unfillable.get(
+                attribute, ("absent", None, None)
+            )
             fixes.append(
                 Fix(
                     product_id=product_id, run_id=run_id,
                     type=FixType.merchant_todo, status=FixStatus.proposed,
                     target=f"spec:{attribute}", after_json=None,
-                    reason=(
-                        f"No {attribute.replace('_', ' ')} stated in any source field; "
-                        "a merchant must add it."
+                    reason=_todo_reason(attribute, drop_reason, rejected_value, rejected_field),
+                    # Queryable drop category for a fabrication/mis_assignment to-do (NULL=absent).
+                    source_json=(
+                        None
+                        if drop_reason == "absent"
+                        else [{
+                            "attribute": attribute, "source_field": rejected_field,
+                            "rejected_value": rejected_value, "drop_reason": drop_reason,
+                        }]
                     ),
                 )
             )
 
-    if has_description_gap:
-        if grounded:
-            fixes.append(
-                Fix(
-                    product_id=product_id, run_id=run_id,
-                    type=FixType.description, status=FixStatus.proposed,
-                    target="body_html",
-                    before_json={"body_html": product.body},
-                    after_json={"body_html": _compose_description(product.body, grounded)},
-                    source_json=[_citation(a, c) for a, c in grounded.items()],
-                    diff="restructured description from grounded attributes",
-                    base_source_hash=base_hash,
-                )
+    # A description fix surfaces specs the body LACKS — only attributes grounded from a non-body
+    # source (variants/metafields/product_type). Body-grounded attributes are already in the prose.
+    non_body_grounded = {
+        attr: cand for attr, cand in grounded.items() if cand.source_field in _NON_BODY_SOURCES
+    }
+    if non_body_grounded:
+        fixes.append(
+            Fix(
+                product_id=product_id, run_id=run_id,
+                type=FixType.description, status=FixStatus.proposed,
+                target="body_html",
+                before_json={"body_html": product.body},
+                after_json={"body_html": _compose_description(product.body, non_body_grounded)},
+                source_json=[_citation(a, c) for a, c in non_body_grounded.items()],
+                diff=(
+                    f"appended {len(non_body_grounded)} labeled spec line(s) to the description; "
+                    "existing prose unchanged"
+                ),
+                base_source_hash=base_hash,
             )
-        else:
-            fixes.append(
-                Fix(
-                    product_id=product_id, run_id=run_id,
-                    type=FixType.merchant_todo, status=FixStatus.proposed,
-                    target="body_html", after_json=None,
-                    reason=(
-                        "No extractable specs to compose a spec-dense description; "
-                        "a merchant must write one."
-                    ),
-                )
+        )
+    elif has_description_gap:
+        fixes.append(
+            Fix(
+                product_id=product_id, run_id=run_id,
+                type=FixType.merchant_todo, status=FixStatus.proposed,
+                target="body_html", after_json=None,
+                reason=(
+                    "No extractable specs to compose a spec-dense description; "
+                    "a merchant must write one."
+                ),
             )
+        )
 
     if has_gtin_gap:
         fixes.append(
