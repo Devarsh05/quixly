@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import EngineRun
 from app.services.extractor_llm import ExtractedBrand, ExtractedBrands, ExtractorClient
-from app.services.matching import normalize_and_match, normalize_text
+from app.services.matching import is_grounded, normalize_and_match
 from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -62,13 +62,12 @@ class ExtractorReport(BaseModel):
 
 
 def _is_grounded(brand: str, answer_text: str) -> bool:
-    """True iff ``brand`` appears in ``answer_text`` under normalized substring matching.
+    """True iff ``brand`` appears literally in ``answer_text`` (normalized substring).
 
-    The anti-fabrication guard: literal presence only, no suffix stripping (that is for alias
-    matching). An empty normalized brand never matches.
+    Thin alias for the shared ``services.matching.is_grounded`` primitive — one grounding
+    definition, reused by the Optimizer too. Kept as a named export for the live grounding test.
     """
-    needle = normalize_text(brand)
-    return bool(needle) and needle in normalize_text(answer_text)
+    return is_grounded(brand, answer_text)
 
 
 def _answer_text(response_raw: dict) -> str | None:

@@ -30,6 +30,18 @@ def normalize_text(text: str) -> str:
     return " ".join(_PUNCT.sub(" ", text).casefold().split())
 
 
+def is_grounded(needle: str, haystack: str) -> bool:
+    """True iff ``needle`` appears in ``haystack`` under normalized substring matching.
+
+    The single anti-fabrication primitive: literal presence only (no suffix stripping — that is
+    for alias matching). An empty normalized needle never matches. Reused by the Extractor's
+    brand-grounding guard and the Optimizer's attribute/snippet grounding — one definition, so the
+    two nodes can never drift apart on what "grounded" means.
+    """
+    normalized = normalize_text(needle)
+    return bool(normalized) and normalized in normalize_text(haystack)
+
+
 def _normalize_brand(name: str) -> str:
     """Normalize a brand name and strip trailing generic suffixes (coffee/roasters/co/...)."""
     tokens = normalize_text(name).split()

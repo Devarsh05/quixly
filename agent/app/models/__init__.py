@@ -4,6 +4,7 @@ from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.audit import Audit
 from app.models.base import Base, TimestampMixin
 from app.models.engine_run import EngineRun
+from app.models.fix import Fix, FixStatus, FixType
 from app.models.ingest_run import IngestRun, IngestStatus
 from app.models.product import Product
 from app.models.query_panel import QueryPanel
@@ -17,6 +18,9 @@ __all__ = [
     "Base",
     "TimestampMixin",
     "EngineRun",
+    "Fix",
+    "FixStatus",
+    "FixType",
     "IngestRun",
     "IngestStatus",
     "Product",
