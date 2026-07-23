@@ -63,11 +63,15 @@ class Fix(Base):
     # ("spec:altitude", "gtin").
     target: Mapped[str] = mapped_column(String(255), nullable=False)
 
-    before_json: Mapped[dict | list | None] = mapped_column(JSONB, nullable=True)
+    # ``none_as_null=True`` on every nullable JSONB column: a Python ``None`` must persist as SQL
+    # NULL, not JSONB ``'null'``. Load-bearing for ``after_json``: the step-4 Publisher filters
+    # ``after_json IS NOT NULL`` to find publishable fixes, and a JSONB ``'null'`` would match a
+    # merchant_todo and publish it (PRD §13). Same for querying ``source_json IS NULL`` on to-dos.
+    before_json: Mapped[dict | list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     # NULL for a merchant_todo (nothing to write) — the load-bearing publishability signal.
-    after_json: Mapped[dict | list | None] = mapped_column(JSONB, nullable=True)
+    after_json: Mapped[dict | list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     # Grounding citation(s): [{attribute, source_field, snippet}]. NULL for a merchant_todo.
-    source_json: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    source_json: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
 
     diff: Mapped[str | None] = mapped_column(Text, nullable=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)

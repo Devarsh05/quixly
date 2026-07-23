@@ -7,7 +7,7 @@ metafield fixes with a source citation; absent/ambiguous/hallucinated → mercha
 """
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from app.graph.optimizer import run_optimizer
 from app.models import (
@@ -167,7 +167,7 @@ async def test_mis_assigned_value_is_dropped_and_gap_still_becomes_a_todo(db, sh
     assert todo.source_json[0]["source_field"] == "body_html"
 
 
-async def test_absent_todo_keeps_the_plain_reason_and_no_source_json(db, shop):
+async def test_absent_todo_has_sql_null_source_and_after_json(db, shop):
     product = await _seed(db, shop.id, gaps=[_gap("spec_missing", "altitude")], body="A coffee.")
     client = ScriptedOptimizerClient(
         [AttributeCandidate(attribute="altitude", value=None, source_field=None, snippet=None,
@@ -176,7 +176,21 @@ async def test_absent_todo_keeps_the_plain_reason_and_no_source_json(db, shop):
     await run_optimizer(db, product.id, client)
     todo = (await _fixes(db, product.id))[0]
     assert "No altitude stated in any source field" in todo.reason
-    assert todo.source_json is None
+
+    # SQL NULL, not JSONB 'null' — so `WHERE ... IS NOT NULL` EXCLUDES to-dos. The after_json
+    # check is the load-bearing publish-safety invariant (step-4 filters after_json IS NOT NULL).
+    row = (
+        await db.execute(
+            text(
+                "SELECT (source_json IS NULL) AS src_null, (after_json IS NULL) AS after_null, "
+                "(after_json = 'null'::jsonb) AS after_jsonnull FROM fixes WHERE id = :id"
+            ),
+            {"id": todo.id},
+        )
+    ).one()
+    assert row.src_null is True
+    assert row.after_null is True
+    assert row.after_jsonnull is None  # JSONB-'null' comparison yields SQL NULL → it's not 'null'
 
 
 async def test_missing_gtin_is_always_a_todo_and_never_carries_a_barcode(db, shop):
@@ -210,12 +224,20 @@ async def test_body_only_grounded_yields_metafield_but_no_description(db, shop):
     assert FixType.description not in types  # no redundant re-append
 
 
+RICH_HTML = (
+    "<h2>Our Signature Roast</h2>"
+    '<p>Crafted with <strong>care</strong>. Read our '
+    '<a href="https://example.test/story">story</a>.</p>'
+    "<ul><li>Small batch</li><li>Fair trade</li></ul>"
+)
+
+
 async def test_non_body_grounded_yields_metafield_and_description(db, shop):
     # roast is a gap; the value lives in variants_json (a non-body source) — so surfacing it into
     # the description adds information the prose lacks.
     product = await _seed(
         db, shop.id, gaps=[_gap("spec_missing", "roast_level")],
-        body="A nice coffee.", variants=[{"title": "Roast: Medium-Light"}],
+        body="<p>A nice coffee.</p>", variants=[{"title": "Roast: Medium-Light"}],
     )
     client = ScriptedOptimizerClient(
         [AttributeCandidate(attribute="roast_level", value="Medium-Light",
@@ -229,8 +251,36 @@ async def test_non_body_grounded_yields_metafield_and_description(db, shop):
     assert len([f for f in fixes if f.type == FixType.metafield]) == 1
     desc = [f for f in fixes if f.type == FixType.description]
     assert len(desc) == 1
-    assert desc[0].after_json["body_html"].startswith("A nice coffee.")  # prose untouched
+    # against the ORIGINAL body_html, byte-for-byte — impossible to satisfy with stripped text.
+    assert desc[0].after_json["body_html"].startswith(desc[0].before_json["body_html"])
     assert "Medium-Light" in desc[0].after_json["body_html"]
+
+
+async def test_description_fix_preserves_html_verbatim(db, shop):
+    product = await _seed(
+        db, shop.id, gaps=[_gap("spec_missing", "roast_level")],
+        body=RICH_HTML, variants=[{"title": "Roast: Medium-Light"}],
+    )
+    client = ScriptedOptimizerClient(
+        [AttributeCandidate(attribute="roast_level", value="Medium-Light",
+                            source_field="variants_json", snippet="Roast: Medium-Light",
+                            ambiguous=False)]
+    )
+
+    await run_optimizer(db, product.id, client)
+
+    desc = [f for f in await _fixes(db, product.id) if f.type == FixType.description][0]
+    after = desc.after_json["body_html"]
+    assert desc.before_json["body_html"] == RICH_HTML
+    assert after.startswith(RICH_HTML)  # merchant's markup preserved byte-for-byte
+    # every original tag survives verbatim
+    for tag in ("<h2>", "</h2>", "<strong>", "</strong>",
+                '<a href="https://example.test/story">', "</a>", "<ul>", "<li>Small batch</li>"):
+        assert tag in after
+    # the appended block is valid HTML with no bare newline
+    appended = after[len(RICH_HTML):]
+    assert appended == "<p><strong>Details</strong></p><ul><li>Roast Level: Medium-Light</li></ul>"
+    assert "\n" not in appended
 
 
 async def test_run_id_is_stamped(db, shop):

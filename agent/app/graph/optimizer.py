@@ -23,6 +23,7 @@ injected so tests drive a scripted client against the transaction-scoped ``db`` 
 import hashlib
 import json
 import re
+from html import escape
 
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -134,12 +135,19 @@ def _citation(attribute: str, candidate: AttributeCandidate) -> dict:
     }
 
 
-def _compose_description(body: str | None, grounded: dict[str, AttributeCandidate]) -> str:
-    """Compose a spec-dense description by APPENDING grounded specs; existing prose is untouched."""
-    base = _strip_html(body).strip()
-    lines = [f"- {attr.replace('_', ' ').title()}: {cand.value}" for attr, cand in grounded.items()]
-    details = "Details:\n" + "\n".join(lines)
-    return f"{base}\n\n{details}" if base else details
+def _compose_description(body_html: str | None, grounded: dict[str, AttributeCandidate]) -> str:
+    """APPEND a valid-HTML Details list to the ORIGINAL body_html; existing markup is untouched.
+
+    The column is ``body_html`` — the written value must stay valid HTML and preserve the
+    merchant's markup byte-for-byte. HTML stripping is for EXTRACTION INPUT ONLY
+    (``_build_source_fields``) and must never reach ``after_json``. Values are HTML-escaped.
+    """
+    items = "".join(
+        f"<li>{escape(attr.replace('_', ' ').title())}: {escape(cand.value or '')}</li>"
+        for attr, cand in grounded.items()
+    )
+    block = f"<p><strong>Details</strong></p><ul>{items}</ul>"
+    return f"{body_html or ''}{block}"
 
 
 def _todo_reason(
