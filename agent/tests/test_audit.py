@@ -2,7 +2,8 @@
 
 DB-backed (real Postgres ``db`` fixture, rolled back per test). The node loads a product, derives
 its class from merchant fields (``classify_product``), scores it with the per-class rubric, and
-persists one ``audits`` row carrying the class, gaps, nullable spec_coverage, and severity.
+persists one ``audits`` row carrying the class, gaps, BOTH nullable coverage numbers
+(``spec_coverage`` = prose, ``structured_coverage`` = metafields), and severity.
 """
 
 import pytest
@@ -61,17 +62,39 @@ async def _run(db, shop_id: int) -> AgentRun:
     return run
 
 
-async def test_audit_persists_class_and_coverage_for_a_clean_coffee(db, shop):
+async def test_audit_persists_both_coverage_numbers_for_a_rich_prose_coffee(db, shop):
+    """RICH_BODY states all seven families in prose but carries no metafields, so the two numbers
+    diverge — and BOTH are persisted. Storing only one would lose the addressable-set finding."""
     product = await _product(db, shop.id)
 
     outcome = await run_audit(db, product.id)
 
     row = (await db.execute(select(Audit).where(Audit.id == outcome.audit_id))).scalar_one()
     assert row.product_class == "coffee"
-    assert row.severity == "none"
-    assert row.spec_coverage == 1.0
-    assert row.gaps_json == []
+    assert row.spec_coverage == 1.0         # prose
+    assert row.structured_coverage == 0.0   # nothing machine-readable
+    assert row.severity == "medium"         # seven unstructured (auto-fixable) families
+    assert {g["state"] for g in row.gaps_json} == {"unstructured"}
+    assert outcome.structured_coverage == 0.0
     assert outcome.audited is True
+
+
+async def test_audit_persists_no_gaps_for_a_fully_structured_coffee(db, shop):
+    product = await _product(
+        db, shop.id,
+        metafields_json=[
+            {"namespace": "custom", "key": key, "value": "x"}
+            for key in ("roast_level", "origin", "process", "variety", "tasting_notes",
+                        "altitude", "brew_method")
+        ],
+    )
+
+    outcome = await run_audit(db, product.id)
+
+    row = (await db.execute(select(Audit).where(Audit.id == outcome.audit_id))).scalar_one()
+    assert row.structured_coverage == 1.0
+    assert row.severity == "none"
+    assert row.gaps_json == []
 
 
 async def test_audit_equipment_missing_gtin_is_medium_with_null_coverage(db, shop):
@@ -84,7 +107,9 @@ async def test_audit_equipment_missing_gtin_is_medium_with_null_coverage(db, sho
 
     assert outcome.product_class == "equipment"
     assert outcome.severity == "medium"
+    # Equipment has no grounded spec vocabulary — BOTH numbers are NULL, never a misleading 0.0.
     assert outcome.spec_coverage is None
+    assert outcome.structured_coverage is None
     assert {g.code for g in outcome.gaps} == {"missing_gtin"}
 
 
@@ -99,6 +124,7 @@ async def test_audit_excludes_a_draft_product(db, shop):
     assert row.severity == "not_audited"
     assert row.gaps_json == []
     assert row.spec_coverage is None
+    assert row.structured_coverage is None
 
 
 async def test_audit_stamps_run_id_when_scoped(db, shop):

@@ -2,7 +2,13 @@
 
 Produced by ``app.graph.audit`` from the rubric in ``services.audit_rubric``: the gaps found in a
 product's catalog data (missing description / GTIN / metafields, not discoverable, absent spec
-attributes), a ``severity`` band, and a ``spec_coverage`` ratio (present spec families / total).
+attributes), a ``severity`` band, and **two** coverage ratios.
+
+**Both coverage numbers are kept; neither replaces the other** (step 2b). ``structured_coverage``
+counts spec families carried by a metafield — the headline AI-legibility score, what engines
+actually read. ``spec_coverage`` counts families stated in the PROSE (title/body). The *difference*
+between them is the addressable set the Optimizer can fix automatically, which is why storing only
+one of them would lose the finding.
 
 **Run identity from day one.** ``run_id`` is a nullable FK to ``agent_runs`` (``ondelete=SET
 NULL``), the same pattern as ``engine_runs.run_id`` — an audit is measurement data we preserve
@@ -41,9 +47,14 @@ class Audit(Base):
     # Verifier compares like-for-like and the report can break down by class.
     product_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
     gaps_json: Mapped[list] = mapped_column(JSONB, nullable=False)
-    # NULLABLE: spec scoring only applies to classes with a grounded vocabulary (coffee today).
-    # Equipment / other / not-audited (draft) products carry NULL — never a misleading 0.0.
+    # BOTH coverage columns are NULLABLE for the same reason: spec scoring only applies to classes
+    # with a grounded vocabulary (coffee today). Equipment / other / not-audited (draft) products
+    # carry NULL — never a misleading 0.0.
+    #
+    # PROSE coverage — families stated in title/body.
     spec_coverage: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # STRUCTURED coverage — families carried by a metafield. The headline AI-legibility score.
+    structured_coverage: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Bands: none | low | medium | high, plus ``not_audited`` for products excluded from the
     # population (not visible). Plain String, like the other status columns.
     severity: Mapped[str] = mapped_column(String(16), nullable=False)
