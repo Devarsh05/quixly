@@ -21,8 +21,29 @@ merchant data by ``services.catalog.classify_product`` — never inferred by a m
 * **Metafields** are a store-level finding (computed by the caller across the population), not a
   per-product gap — so an empty catalog no longer inflates every product's severity.
 
-Presence is a normalised substring match (``services.matching.normalize_text``) over the product's
-searchable text — title + description + every metafield value.
+**Three-state spec model (step 2b).** Every (product, spec family) is one of:
+
+* ``structured``   — carried by a metafield keyed to the family. Machine-readable; nothing to do.
+* ``unstructured`` — stated in the PROSE (title/body) but not in a metafield. Optimizer-fixable.
+* ``absent``       — nowhere. A merchant to-do.
+
+So there are **two coverage numbers, and neither replaces the other**: ``structured_coverage`` is
+the headline AI-legibility score (what engines actually read), ``spec_coverage`` is PROSE coverage,
+and the **difference between them is the addressable set** ("prose 0.86 / structured 0.00" is a
+sharper finding than either alone).
+
+Prose presence is a normalised substring match (``services.matching.normalize_text``) over title +
+description only — **metafield values are the structured channel and are deliberately excluded**
+from the prose text, or a structured family would also inflate prose coverage.
+
+**The audit's unstructured/absent split is a deterministic DETECT-BASED PROXY.** The rubric stays
+LLM-free, so it cannot ask an extractor what is really in the prose; it asks ``detect``. The
+Optimizer decides the same split by *extraction*, and the two **may diverge** — ``detect`` misses
+``"Roast: Medium-Light"``, so the audit calls roast ``absent`` while the Optimizer extracts and
+fills it. That divergence is expected: the audit is an estimate, the Optimizer's fills are ground
+truth. Crucially the Optimizer does **not** read ``detect`` or the audit's gaps to choose targets
+(see ``graph.optimizer``), so refining ``detect`` moves these numbers **without** adding or removing
+a single fill.
 """
 
 import re
@@ -44,8 +65,10 @@ SPEC_MISSING = "spec_missing"
 # deliberately-not-live product is reported separately, not scored.
 _NOT_DISCOVERABLE_STATES = {"draft", "archived", "unlisted"}
 
-# Classes for which a check applies.
-_SPEC_SCORED_CLASSES = {"coffee"}
+# Classes for which a check applies. SPEC_SCORED_CLASSES is PUBLIC: the Optimizer reads it to gate
+# spec targeting by class. Without that gate an equipment product would be asked for seven coffee
+# families, because the Optimizer no longer derives its targets from the audit's gaps.
+SPEC_SCORED_CLASSES = frozenset({"coffee"})
 _GTIN_APPLICABLE_CLASSES = {"equipment"}
 
 # --- Spec vocabulary (anchored to run-75 cited competitor pages) ----------------------------
@@ -75,6 +98,13 @@ class SpecFamily(BaseModel):
     kind: str  # "closed" | "format" | "open"
     values: tuple[str, ...] = ()  # closed: valid value phrases (word-boundary matched)
     labels: tuple[str, ...] = ()  # the family's own label terms (open uses these + competitors')
+    # Metafield KEYS that mean "this family is already structured" (step 2b), beyond the family
+    # name itself. Deliberately a separate, curated list rather than a reuse of ``labels``: labels
+    # exist for snippet matching and include generic terms ("notes", "aroma", "masl") that would
+    # false-positive as keys. A false ``structured`` is the dangerous direction — it both inflates
+    # the headline score and silently drops the family from the Optimizer's targets — so this list
+    # stays conservative.
+    metafield_aliases: tuple[str, ...] = ()
 
 
 SPEC_FAMILIES: dict[str, SpecFamily] = {
@@ -86,6 +116,7 @@ SPEC_FAMILIES: dict[str, SpecFamily] = {
         kind="closed",
         values=("light", "medium", "dark", "espresso", "decaf", "blonde", "cinnamon", "french"),
         labels=("roast level", "roast", "agtron"),
+        metafield_aliases=("roast", "roast level", "roastlevel"),
     ),
     "origin": SpecFamily(
         detect=(
@@ -101,6 +132,7 @@ SPEC_FAMILIES: dict[str, SpecFamily] = {
             "bolivia", "ecuador", "jamaica", "indonesia", "java",
         ),
         labels=("origin", "single-origin", "single origin"),
+        metafield_aliases=("origin", "single origin", "country of origin", "country"),
     ),
     "process": SpecFamily(
         detect=(
@@ -113,6 +145,7 @@ SPEC_FAMILIES: dict[str, SpecFamily] = {
             "black honey", "red honey", "white honey", "carbonic", "dry",
         ),
         labels=("process", "fermentation"),
+        metafield_aliases=("process", "processing", "processing method", "process method"),
     ),
     "variety": SpecFamily(
         detect=(
@@ -125,6 +158,7 @@ SPEC_FAMILIES: dict[str, SpecFamily] = {
             "sl34", "peaberry", "pacamara", "mundo novo", "maragogipe", "villa sarchi", "castillo",
         ),
         labels=("varietal", "variety", "cultivar"),
+        metafield_aliases=("variety", "varietal", "varietals", "cultivar"),
     ),
     "tasting_notes": SpecFamily(
         detect=(
@@ -135,6 +169,8 @@ SPEC_FAMILIES: dict[str, SpecFamily] = {
         kind="open",
         labels=("tasting notes", "notes of", "flavor notes", "flavour notes", "tasting note",
                 "aroma", "notes"),
+        metafield_aliases=("tasting notes", "tasting note", "flavor notes", "flavour notes",
+                           "flavor profile", "flavour profile"),
     ),
     "altitude": SpecFamily(
         detect=(
@@ -143,6 +179,7 @@ SPEC_FAMILIES: dict[str, SpecFamily] = {
         ),
         kind="format",
         labels=("altitude", "elevation", "masl", "grown at"),
+        metafield_aliases=("altitude", "elevation", "growing altitude", "growing elevation"),
     ),
     "brew_method": SpecFamily(
         detect=(
@@ -155,6 +192,7 @@ SPEC_FAMILIES: dict[str, SpecFamily] = {
             "moka", "filter", "immersion", "percolator", "chemex", "v60", "batch brew",
         ),
         labels=("brew method", "brewing", "brew"),
+        metafield_aliases=("brew method", "brewing method", "brew", "recommended brew method"),
     ),
 }
 
@@ -163,6 +201,47 @@ SPEC_FAMILIES: dict[str, SpecFamily] = {
 SPEC_VOCABULARY: dict[str, tuple[str, ...]] = {
     family: spec.detect for family, spec in SPEC_FAMILIES.items()
 }
+
+
+def _normalize_key(text: str) -> str:
+    """Normalize a metafield key for comparison. Underscores are word chars to ``normalize_text``
+    (so ``roast_level`` would not equal ``roast level``); flatten them to spaces first."""
+    return normalize_text(text.replace("_", " "))
+
+
+# Metafield key -> family, built once from the single SPEC_FAMILIES definition. Namespace-agnostic:
+# merchants pick their own namespace, and the family is named by the KEY (the Optimizer writes
+# ``custom.<family>``, see graph.optimizer).
+_STRUCTURED_KEYS: dict[str, str] = {
+    _normalize_key(alias): family
+    for family, spec in SPEC_FAMILIES.items()
+    for alias in (family, *spec.metafield_aliases)
+}
+
+
+def structured_families(metafields: list[dict] | None) -> set[str]:
+    """Spec families already carried by a structured metafield — the ``structured`` state.
+
+    **One definition, both consumers** (CLAUDE.md "one normalizer"): the rubric reads it for
+    ``structured_coverage``, and the Optimizer subtracts it from the spec families to get its
+    targets. Because targeting is derived from THIS and never from ``detect``/``audit.gaps``,
+    refining detection can never add or remove a fill opportunity.
+
+    A key with an empty/absent value does **not** count as structured — an empty metafield is not
+    machine-readable, and treating it as structured would both inflate the headline score and drop
+    a real gap from the Optimizer's targets.
+    """
+    found: set[str] = set()
+    for field in metafields or []:
+        if not isinstance(field, dict):
+            continue
+        value = field.get("value")
+        if not (isinstance(value, str) and value.strip()):
+            continue
+        family = _STRUCTURED_KEYS.get(_normalize_key(str(field.get("key") or "")))
+        if family is not None:
+            found.add(family)
+    return found
 
 
 def _contains_term(term: str, text: str) -> bool:
@@ -202,24 +281,40 @@ def validate_spec_value(family: str, value: str, snippet: str) -> bool:
 
 # --- Severity weighting ---------------------------------------------------------------------
 # Weighted score → band, over the DISCOVERABLE population. Weights/bands are module constants so
-# tuning is a data change. missing_gtin is heaviest per-gap so a manufactured good lacking its GTIN
-# lands at medium on its own; a coffee product with almost no spec attributes accumulates to high.
-_WEIGHTS: dict[str, int] = {
-    MISSING_GTIN: 3,
-    MISSING_DESCRIPTION: 2,
-    SPEC_MISSING: 1,  # per missing family
-}
-_LOW_MAX = 2
-_MEDIUM_MAX = 5
+# tuning is a data change.
+#
+# Step 2b re-baseline (Gate G re-approved): a spec family's weight is now STATE-based — an
+# ``absent`` family (the merchant must supply it) weighs more than an ``unstructured`` one (the
+# Optimizer can structure it automatically), and a ``structured`` family emits no gap at all.
+# The non-spec weights are scaled by the same factor as ``absent`` so they keep their step-1
+# meaning: missing_gtin is still heavy enough that a manufactured good lacking its GTIN lands at
+# medium ON ITS OWN. (Leaving them at 3/2 against the doubled spec weights would silently demote
+# every GTIN-less product to low.)
+STATE_UNSTRUCTURED = "unstructured"
+STATE_ABSENT = "absent"
+
+_MISSING_GTIN_WEIGHT = 6
+_MISSING_DESCRIPTION_WEIGHT = 4
+_SPEC_STATE_WEIGHTS: dict[str, int] = {STATE_ABSENT: 2, STATE_UNSTRUCTURED: 1}
+_LOW_MAX = 4
+_MEDIUM_MAX = 9
 
 SEVERITY_NOT_AUDITED = "not_audited"
 
 
 class AuditGap(BaseModel):
-    """One deficiency found by the rubric. ``attribute`` is set only for ``spec_missing`` gaps."""
+    """One deficiency found by the rubric.
+
+    ``attribute`` and ``state`` are set only for ``spec_missing`` gaps. ``state`` is the
+    DETECT-BASED, deterministic three-state proxy: ``unstructured`` = detected in the prose but not
+    in a metafield, ``absent`` = detected nowhere. It is an *approximation* — the only one the
+    rubric can compute without an LLM — and the Optimizer's extraction-based split may legitimately
+    differ (see the module docstring).
+    """
 
     code: str
     attribute: str | None = None
+    state: str | None = None
     detail: str
 
 
@@ -229,24 +324,31 @@ class AuditResult(BaseModel):
     audited: bool
     product_class: str
     gaps: list[AuditGap]
+    # PROSE coverage: families stated in title/body. Informational; the addressable set is the
+    # difference between this and structured_coverage.
     spec_coverage: float | None  # None when the class is not spec-scored or the product is excluded
+    # Headline AI-legibility: families carried by a structured metafield — what engines read.
+    structured_coverage: float | None
     severity: str  # none | low | medium | high | not_audited
     excluded_reason: str | None = None
 
 
-def _metafield_values(metafields: list[dict] | None) -> list[str]:
-    values: list[str] = []
-    for field in metafields or []:
-        value = field.get("value")
-        if isinstance(value, str) and value:
-            values.append(value)
-    return values
+def _gap_weight(gap: AuditGap) -> int:
+    if gap.code == MISSING_GTIN:
+        return _MISSING_GTIN_WEIGHT
+    if gap.code == MISSING_DESCRIPTION:
+        return _MISSING_DESCRIPTION_WEIGHT
+    return _SPEC_STATE_WEIGHTS[gap.state or STATE_ABSENT]
 
 
-def _searchable_text(title: str | None, body: str | None, metafields: list[dict] | None) -> str:
-    body_text = _HTML_TAG.sub(" ", body or "")
-    parts = [title or "", body_text, *_metafield_values(metafields)]
-    return normalize_text(" ".join(parts))
+def _prose_text(title: str | None, body: str | None) -> str:
+    """Title + description only — the PROSE channel.
+
+    Metafield values are the STRUCTURED channel and are deliberately excluded: counting them here
+    too would make a structured family raise prose coverage as well, and the difference between the
+    two numbers (the addressable set) would collapse.
+    """
+    return normalize_text(" ".join([title or "", _HTML_TAG.sub(" ", body or "")]))
 
 
 def _has_text(body: str | None) -> bool:
@@ -282,6 +384,7 @@ def evaluate_product(
             product_class=product_class,
             gaps=[],
             spec_coverage=None,
+            structured_coverage=None,
             severity=SEVERITY_NOT_AUDITED,
             excluded_reason="not_visible",
         )
@@ -297,28 +400,55 @@ def evaluate_product(
         )
 
     spec_coverage: float | None = None
-    if product_class in _SPEC_SCORED_CLASSES:
-        text = _searchable_text(title, body, metafields)
-        present = 0
-        for family, phrases in SPEC_VOCABULARY.items():
-            if any(normalize_text(phrase) in text for phrase in phrases):
-                present += 1
+    structured_coverage: float | None = None
+    if product_class in SPEC_SCORED_CLASSES:
+        prose = _prose_text(title, body)
+        structured = structured_families(metafields)
+        in_prose = {
+            family
+            for family, phrases in SPEC_VOCABULARY.items()
+            if any(normalize_text(phrase) in prose for phrase in phrases)
+        }
+        total = len(SPEC_VOCABULARY)
+        spec_coverage = len(in_prose) / total
+        structured_coverage = len(structured) / total
+
+        # Three-state (detect-based proxy): a structured family is machine-readable and emits no
+        # gap; everything else is a gap tagged with WHY it is one, which drives both the weight and
+        # the merchant-facing detail.
+        for family in SPEC_VOCABULARY:
+            if family in structured:
+                continue
+            label = family.replace("_", " ")
+            if family in in_prose:
+                gaps.append(
+                    AuditGap(
+                        code=SPEC_MISSING,
+                        attribute=family,
+                        state=STATE_UNSTRUCTURED,
+                        detail=(
+                            f"{label} is stated in the description but not in a metafield, "
+                            "so AI engines cannot read it reliably."
+                        ),
+                    )
+                )
             else:
                 gaps.append(
                     AuditGap(
                         code=SPEC_MISSING,
                         attribute=family,
-                        detail=f"No {family.replace('_', ' ')} stated in the product's text.",
+                        state=STATE_ABSENT,
+                        detail=f"No {label} stated anywhere in the product's data.",
                     )
                 )
-        spec_coverage = present / len(SPEC_VOCABULARY)
 
-    score = sum(_WEIGHTS[gap.code] for gap in gaps)
+    score = sum(_gap_weight(gap) for gap in gaps)
     return AuditResult(
         audited=True,
         product_class=product_class,
         gaps=gaps,
         spec_coverage=spec_coverage,
+        structured_coverage=structured_coverage,
         severity=_severity(score),
     )
 

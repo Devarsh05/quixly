@@ -2,6 +2,7 @@
 
 from arq.connections import RedisSettings
 
+from app.jobs.fix import run_fix_task
 from app.jobs.ingest_catalog import ingest_catalog
 from app.jobs.scan import run_scan_task
 from app.redis import close_redis
@@ -23,7 +24,7 @@ async def shutdown(ctx: dict) -> None:
 class WorkerSettings:
     """Arq worker settings."""
 
-    functions = [ingest_catalog, run_scan_task]
+    functions = [ingest_catalog, run_scan_task, run_fix_task]
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)

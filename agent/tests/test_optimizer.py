@@ -41,6 +41,25 @@ def _gap(code: str, attribute: str | None = None) -> dict:
     return {"code": code, "attribute": attribute, "detail": f"{code} {attribute or ''}".strip()}
 
 
+_ALL_FAMILIES = (
+    "roast_level", "origin", "process", "variety", "tasting_notes", "altitude", "brew_method",
+)
+
+
+def _only_target(family: str) -> list[dict]:
+    """Metafields for every family EXCEPT ``family``.
+
+    Targeting is structural (step 2b): the Optimizer asks for every family the product does not
+    already carry as a metafield. Marking the other six structured is how a test isolates one
+    target — and it exercises the real targeting path rather than working around it.
+    """
+    return [
+        {"namespace": "custom", "key": f, "value": "already structured"}
+        for f in _ALL_FAMILIES
+        if f != family
+    ]
+
+
 @pytest.fixture
 async def shop(db):
     shop = Shop(shop_domain="optimizer-test.myshopify.com", status=ShopStatus.active)
@@ -77,7 +96,10 @@ async def _fixes(db, product_id):
 
 async def test_grounded_spec_becomes_a_metafield_fix_with_citation(db, shop):
     body = "Roast level: light (Agtron 68)."
-    product = await _seed(db, shop.id, gaps=[_gap("spec_missing", "roast_level")], body=body)
+    product = await _seed(
+        db, shop.id, gaps=[_gap("spec_missing", "roast_level")], body=body,
+        metafields=_only_target("roast_level"),
+    )
     client = ScriptedOptimizerClient(
         [AttributeCandidate(
             attribute="roast_level", value="light", source_field="body_html",
@@ -102,7 +124,8 @@ async def test_grounded_spec_becomes_a_metafield_fix_with_citation(db, shop):
 
 async def test_absent_spec_becomes_a_merchant_todo(db, shop):
     product = await _seed(
-        db, shop.id, gaps=[_gap("spec_missing", "altitude")], body="A pleasant everyday coffee."
+        db, shop.id, gaps=[_gap("spec_missing", "altitude")], body="A pleasant everyday coffee.",
+        metafields=_only_target("altitude"),
     )
     client = ScriptedOptimizerClient(
         [AttributeCandidate(attribute="altitude", value=None, source_field=None, snippet=None,
@@ -123,7 +146,8 @@ async def test_hallucinated_candidate_is_dropped_not_emitted(db, shop):
     # Model claims "dark" from a snippet that isn't in the source → guard drops it → to-do, and
     # the drop is recorded for observability.
     product = await _seed(
-        db, shop.id, gaps=[_gap("spec_missing", "roast_level")], body="Roast level: light"
+        db, shop.id, gaps=[_gap("spec_missing", "roast_level")], body="Roast level: light",
+        metafields=_only_target("roast_level"),
     )
     client = ScriptedOptimizerClient(
         [AttributeCandidate(attribute="roast_level", value="dark", source_field="body_html",
@@ -143,7 +167,10 @@ async def test_mis_assigned_value_is_dropped_and_gap_still_becomes_a_todo(db, sh
     # The observed defect: "washed" is literally in the body (a process term) but the model
     # grounds it onto brew_method. Present in source, invalid for the family → mis-assignment.
     body = "Single-origin washed Arabica. Process: washed."
-    product = await _seed(db, shop.id, gaps=[_gap("spec_missing", "brew_method")], body=body)
+    product = await _seed(
+        db, shop.id, gaps=[_gap("spec_missing", "brew_method")], body=body,
+        metafields=_only_target("brew_method"),
+    )
     client = ScriptedOptimizerClient(
         [AttributeCandidate(attribute="brew_method", value="washed", source_field="body_html",
                             snippet="Process: washed", ambiguous=False)]
@@ -168,7 +195,10 @@ async def test_mis_assigned_value_is_dropped_and_gap_still_becomes_a_todo(db, sh
 
 
 async def test_absent_todo_has_sql_null_source_and_after_json(db, shop):
-    product = await _seed(db, shop.id, gaps=[_gap("spec_missing", "altitude")], body="A coffee.")
+    product = await _seed(
+        db, shop.id, gaps=[_gap("spec_missing", "altitude")], body="A coffee.",
+        metafields=_only_target("altitude"),
+    )
     client = ScriptedOptimizerClient(
         [AttributeCandidate(attribute="altitude", value=None, source_field=None, snippet=None,
                             ambiguous=False)]
@@ -330,3 +360,103 @@ async def test_excluded_product_produces_no_fixes(db, shop):
 async def test_unknown_product_raises(db):
     with pytest.raises(ValueError):
         await run_optimizer(db, 999999, ScriptedOptimizerClient([]))
+
+
+# --- step 2b: structural targeting (the decoupling) -------------------------------------------
+async def test_targeting_ignores_the_audits_gap_list_entirely(db, shop):
+    """THE decoupling test. The audit found no spec gaps at all, yet every family the product does
+    not carry as a metafield is still targeted.
+
+    This is what breaks the old inverse coupling between detection quality and fill capability:
+    when targets came from gaps, a fill could only happen where ``detect`` had FAILED to notice a
+    spec in the prose, so improving detection destroyed the fill path. Targets are now structural,
+    so refining ``detect`` cannot add or remove a single fill.
+    """
+    product = await _seed(db, shop.id, gaps=[], body="Roast level: light.")
+    client = ScriptedOptimizerClient([])
+
+    await run_optimizer(db, product.id, client)
+
+    _, targets = client.calls[0]
+    assert sorted(targets) == sorted(_ALL_FAMILIES)
+
+
+async def test_a_structured_family_is_not_targeted(db, shop):
+    """Already machine-readable → nothing to do. This is also what makes the node self-limiting."""
+    product = await _seed(
+        db, shop.id, gaps=[_gap("spec_missing", "roast_level")],
+        metafields=[{"namespace": "custom", "key": "roast_level", "value": "Light"}],
+    )
+    client = ScriptedOptimizerClient([])
+
+    await run_optimizer(db, product.id, client)
+
+    _, targets = client.calls[0]
+    assert "roast_level" not in targets
+    assert len(targets) == len(_ALL_FAMILIES) - 1
+
+
+async def test_an_empty_valued_metafield_is_still_targeted(db, shop):
+    """A key with no value is not machine-readable, so the gap is real and must stay targeted —
+    the conservative direction, since a false ``structured`` would silently drop it forever."""
+    product = await _seed(
+        db, shop.id, gaps=[],
+        metafields=[{"namespace": "custom", "key": "roast_level", "value": ""}],
+    )
+    client = ScriptedOptimizerClient([])
+
+    await run_optimizer(db, product.id, client)
+
+    _, targets = client.calls[0]
+    assert "roast_level" in targets
+
+
+async def test_non_coffee_class_is_never_asked_for_coffee_families(db, shop):
+    """Targeting is gated on the persisted product_class. Without that gate, dropping the gap list
+    would ask an espresso machine for its roast level and tasting notes."""
+    product = await _seed(db, shop.id, gaps=[_gap("missing_gtin")], product_type="Brewing Gear")
+    audit = (
+        await db.execute(select(Audit).where(Audit.product_id == product.id))
+    ).scalar_one()
+    audit.product_class = "equipment"
+    await db.commit()
+
+    client = ScriptedOptimizerClient([])
+    report = await run_optimizer(db, product.id, client)
+
+    assert client.calls == []  # no extraction call at all
+    # The GTIN gap is still honoured — a barcode can never be derived.
+    fixes = await _fixes(db, product.id)
+    assert [f.target for f in fixes] == ["gtin"]
+    assert report.fillable == 0
+
+
+async def test_optimizer_converges_once_a_family_is_structured(db, shop):
+    """Idempotence/convergence: publishing a metafield (step 4) makes the family structured, which
+    removes it from targets — so a re-run proposes nothing new for it rather than looping forever.
+    """
+    body = "Roast level: light (Agtron 68)."
+    product = await _seed(
+        db, shop.id, gaps=[_gap("spec_missing", "roast_level")], body=body,
+        metafields=_only_target("roast_level"),
+    )
+    candidate = AttributeCandidate(
+        attribute="roast_level", value="light", source_field="body_html",
+        snippet="Roast level: light", ambiguous=False,
+    )
+
+    first = await run_optimizer(db, product.id, ScriptedOptimizerClient([candidate]))
+    assert first.fillable == 1
+
+    # Simulate the publish: the proposed metafield now exists on the product.
+    product.metafields_json = [
+        *(product.metafields_json or []),
+        {"namespace": "custom", "key": "roast_level", "value": "light"},
+    ]
+    await db.commit()
+
+    client = ScriptedOptimizerClient([candidate])
+    second = await run_optimizer(db, product.id, client)
+
+    assert client.calls == []       # nothing left to target
+    assert second.fillable == 0 and second.todos == 0

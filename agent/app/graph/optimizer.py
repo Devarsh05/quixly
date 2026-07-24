@@ -7,6 +7,13 @@ LLM proposes candidate attribute values; the **grounding guard** (``ground_attri
 what survives: a value is kept only if the model's cited snippet is literally in the named source
 field AND the value is literally in that snippet. A hallucinated value is dropped here, not trusted.
 
+**What it targets (step 2b).** Every spec family the product does not already carry as a metafield
+— a structural set from ``services.audit_rubric.structured_families``, NOT the audit's gap list.
+Each target then resolves to one of two outcomes via the guards below: a value that grounds and
+validates from the product's prose is *unstructured* (prose → metafield, an automatic fill), and
+one that yields nothing is *absent* (a merchant to-do). This is self-limiting: once a family is
+published as a metafield it stops being a target, so re-running converges instead of re-proposing.
+
 Outputs are all deterministic projections of the grounded attribute set:
 
 * **metafield** fix — one per grounded attribute (structured, machine-readable).
@@ -30,7 +37,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Audit, Fix, FixStatus, FixType, Product
-from app.services.audit_rubric import SEVERITY_NOT_AUDITED, validate_spec_value
+from app.services.audit_rubric import (
+    SEVERITY_NOT_AUDITED,
+    SPEC_FAMILIES,
+    SPEC_SCORED_CLASSES,
+    structured_families,
+    validate_spec_value,
+)
 from app.services.matching import is_grounded
 from app.services.optimizer_llm import AttributeCandidate, OptimizerClient
 
@@ -173,7 +186,11 @@ async def run_optimizer(
     *,
     run_id: int | None = None,
 ) -> OptimizerReport:
-    """Propose grounded fixes for a product from its latest audit's gaps. Persists ``fixes`` rows.
+    """Propose grounded fixes for a product. Persists ``fixes`` rows.
+
+    Spec targets are the families the product does not already carry as a metafield (see the module
+    docstring); the audit is still required — for the not-audited exclusion, the product class, and
+    the description/GTIN gaps — but it no longer decides which specs are targeted.
 
     Raises ``ValueError`` if the product or its audit is missing. A not-audited (excluded) product
     produces nothing.
@@ -196,9 +213,29 @@ async def run_optimizer(
         )
 
     gaps = audit.gaps_json or []
-    spec_targets = [
-        g["attribute"] for g in gaps if g.get("code") == "spec_missing" and g.get("attribute")
-    ]
+    # TARGETING IS STRUCTURAL, NOT GAP-DERIVED (step 2b). Targets are every spec family the product
+    # does not already carry as a metafield. This deliberately does NOT read the audit's gaps or the
+    # rubric's ``detect`` list, and that is the whole point: a fill needs an *extractable* value, so
+    # when targeting followed audit gaps a fill could only ever happen where ``detect`` had FAILED
+    # to notice a spec sitting in the prose ("Roast: Medium-Light" is missed; "light roast" is not).
+    # Detection quality and fill capability were inversely coupled — improving one destroyed the
+    # other. Deriving targets structurally severs that: refining ``detect`` now moves only the
+    # audit's coverage/severity numbers and cannot add or remove a single fill.
+    #
+    # Which of these targets is *unstructured* (fillable) vs *absent* (a to-do) is then decided by
+    # extraction + the unchanged grounding/validation guards below — not by ``detect``. The audit
+    # makes the same split with a deterministic detect-based proxy, and the two may legitimately
+    # disagree (see services.audit_rubric).
+    #
+    # Gated on the PERSISTED product_class (never re-classified here) — without that gate an
+    # equipment product would be asked for seven coffee families, since no gap list is filtering it.
+    spec_targets = (
+        sorted(set(SPEC_FAMILIES) - structured_families(product.metafields_json))
+        if audit.product_class in SPEC_SCORED_CLASSES
+        else []
+    )
+    # The description/GTIN gaps are still read from the audit — those are genuine rubric findings
+    # about the product, not a targeting decision.
     has_description_gap = any(g.get("code") == "missing_description" for g in gaps)
     has_gtin_gap = any(g.get("code") == "missing_gtin" for g in gaps)
 
