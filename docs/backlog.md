@@ -69,6 +69,26 @@ the phase by which it should be revisited.
   *nothing at all* on all 18 products, 29 families still recover and false claims stay **0**.
   _Raised: 2026-07-27 (step 2d acceptance, run 839); resolved: 2026-07-27._
 
+## Taxonomy write path (Step 4)
+
+- **DEFERRED — blocked on a scope AND an unproven surface.** The canonical
+  value→`TaxonomyValue`-GID half is **proven** (`agent/app/services/taxonomy_map.py` validates
+  against the live `taxonomy` root). The canonical→**per-shop-metaobject-entry-GID** hop is
+  **untested**, because the metaobject *definition* surface is invisible without
+  **`read_metaobject_definitions`** — a scope outside the currently granted set, requiring a
+  **third merchant consent**.
+  **Before spending that consent on a real merchant**, an isolated spike must prove end-to-end on
+  the dev store: grant `read_metaobject_definitions` → confirm the definition surface actually
+  **POPULATES** (it may be empty even with the scope on this store tier) → resolve one
+  canonical→entry GID → write it → re-read confirms. Only if that spike passes does the taxonomy
+  write path become buildable. **If the surface stays empty with both scopes, taxonomy attributes
+  may not be app-writable on this tier** — a real possible outcome, and cheap to learn via probe.
+  Until then **Step 4 ships on `category` + `description` (both proven)**.
+  The Optimizer may keep **proposing** taxonomy fixes — they are grounded, correct, and publishable
+  the moment the path unblocks — **but the approval UI must not offer an approve that leads to a
+  write that cannot execute.** Raw evidence: `docs/decisions/2c-write-target.md` → L6.
+  _Raised: 2026-07-27 (Phase 3 step-4-preamble, L6)._
+
 ## Shop record
 
 - **`shops.plan` has no writer — nobody populates it.** The column exists and is NULL for the only
