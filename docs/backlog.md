@@ -69,6 +69,17 @@ the phase by which it should be revisited.
   *nothing at all* on all 18 products, 29 families still recover and false claims stay **0**.
   _Raised: 2026-07-27 (step 2d acceptance, run 839); resolved: 2026-07-27._
 
+## Shop record
+
+- **`shops.plan` has no writer — nobody populates it.** The column exists and is NULL for the only
+  shop. Its value is readable live (`shop { plan { displayName partnerDevelopment shopifyPlus } }`
+  → `"Basic App Development"`, `partnerDevelopment: true` on the dev store, confirmed 2026-07-27),
+  but the step-4-preamble diagnostic deliberately **reported without persisting** — a one-off
+  UPDATE would be stale the moment the merchant changes plan. Decide the owner: most naturally the
+  **connect path** (`afterAuth` → agent `connectShop`) or catalog ingest, so it refreshes on every
+  reinstall/scan. Needed before anything gates behavior on plan (billing tiers, Phase 5).
+  _Raised: 2026-07-27 (Phase 3 step-4-preamble)._
+
 ## Token custody / refresh locking
 
 - **Webhook refresh path is pool-coupled and can deadlock under concurrent same-shop webhook

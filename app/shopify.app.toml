@@ -24,7 +24,23 @@ api_version = "2026-07"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products"
+# The settled scope set for the taxonomy write path (Phase 3, step 2c spike + step 4).
+#   write_products    — the taxonomy attribute / description / category writes themselves.
+#                       Implies read_products, which is why it is not listed separately.
+#   read_metaobjects  — toward resolving a taxonomy value to its per-shop metaobject-entry GID.
+#                       A category-attribute metafield is list.metaobject_reference and REJECTS
+#                       the canonical TaxonomyValue GID (spike L1).
+#                       NOT SUFFICIENT ON ITS OWN — proven 2026-07-27 (L6): with this granted,
+#                       the standard-taxonomy metaobject surface is STILL silently empty.
+#                       metaobjectDefinitions needs `read_metaobject_definitions`, a distinct
+#                       scope (schema-level vs this instance-level one). Adding it is a SECOND
+#                       merchant re-consent — a pending decision, not an oversight.
+#   read_publications — confirm the Shopify Catalog / Agentic channel exists on the store and
+#                       whether a product is published to it (spike L4 was ACCESS_DENIED).
+# Scopes are owned by Shopify managed installation (use_legacy_install_flow is unset), so this
+# is the single source of truth: shopify.server.ts deliberately leaves `scopes` undefined.
+# Changing this line triggers a merchant re-consent on next app load.
+scopes = "write_products,read_metaobjects,read_publications"
 
 [auth]
 redirect_urls = [ "https://shopify.dev/apps/default-app-home/api/auth" ]

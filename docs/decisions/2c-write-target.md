@@ -423,3 +423,156 @@ the `read_metaobjects` scope (a re-consent/merchant re-auth event), plus the res
 addition to the `metafieldsSet` mechanics already settled in L1.
 
 **No code, no writes in this follow-up.** Reads only.
+
+---
+
+# Step 4-preamble — scope granted, resolver probed, channel resolved (2026-07-27)
+
+Scope change shipped (`app/shopify.app.toml`: `write_products` → `write_products,
+read_metaobjects, read_publications`), merchant re-consent completed on
+`quixly-ljymkoyb.myshopify.com`, then a **read-only throwaway probe** (uncommitted, deleted after
+the run) via `ShopifyAdminClient.execute()` pulling its token through the app-shell single refresh
+authority. Admin API **2026-07**. **No writes of any kind.**
+
+## L6-gate. The new scopes ARE on the live token — **CONFIRMED**
+
+```
+{ currentAppInstallation { accessScopes { handle } } }
+->
+{"currentAppInstallation":{"accessScopes":[
+  {"handle":"read_metaobjects"},{"handle":"read_publications"},
+  {"handle":"write_products"},{"handle":"read_products"}]}}
+```
+The toml declaration reached the token, not just the config. (`read_products` is implied by
+`write_products` and is not declared.)
+
+## L6. Resolver contract — **STILL BLOCKED. The settled scope set is WRONG.**
+
+**The `read_metaobjects` grant did NOT unblock the taxonomy metaobject surface.** Every path is
+still empty *with the scope granted* — identical to the pre-grant L2/followup results:
+
+```
+metaobjectDefinitions(first:250)                        -> {"edges":[]}
+metaobjectDefinitionByType(<any of 8 spellings>)         -> null
+metaobjects(type:<any of 8 spellings>, first:5)          -> []
+metaobjectByHandle(type:…, handle:"light"/"Light")       -> null
+metafieldDefinitions(ownerType:PRODUCT, ns:"shopify")    -> {"nodes":[]}
+```
+Spellings tried: `shopify--coffee-roast`, `coffee-roast`, `shopify--2024-07--coffee-roast`,
+`shopify--2026-05--coffee-roast`, `shopify--CoffeeRoast`, `shopify.coffee-roast`, `coffee_roast`,
+`shopify--coffee_roast`, plus the `product_taxonomy_*` convention (`product_taxonomy_coffee_roast`,
+`product_taxonomy_country`, `product_taxonomy_coffee_product_form`,
+`product_taxonomy_decaffeination_method`, `product_taxonomy_material`, `product_taxonomy_flavor`)
+— **all 0 entries.** No `ACCESS_DENIED`; the reads are silently filtered, exactly as at L2.
+
+**ROOT CAUSE — a scope we did not know about.** `metaobjectDefinitions` requires
+**`read_metaobject_definitions`**, which is a **distinct scope from `read_metaobjects`**:
+> `read_metaobject_definitions` / `write_metaobject_definitions` grant access to
+> `MetaobjectDefinition`; `read_metaobjects` / `write_metaobjects` grant access to `Metaobject`.
+> — [access scopes](https://shopify.dev/docs/api/usage/access-scopes)
+
+We granted only the **instance-level** scope. The **schema-level** scope is what exposes the
+definitions — and without enumerable definitions we cannot even *discover* the correct `type`
+string, so the `metaobjects` query (which we DO have scope for) cannot be aimed. The two failures
+compound: no definitions → no type name → no entries.
+
+Also note `standardMetaobjectDefinitionTemplates` **does not exist on `QueryRoot` at 2026-07**
+(`undefinedField`), despite appearing in current docs — so the documented
+"enable a standard definition" route is not available at our pinned version.
+
+**Consequence:** the §5 resolver contract is **NOT confirmed live, and NOT refuted** — it remains
+untested, now blocked on a *second, previously-unidentified* scope. **The "settled scope set" in
+CLAUDE.md is incomplete.**
+
+### What IS readable — the canonical layer, and it validates our static map
+
+The `taxonomy` root query works fully at current scope and confirms **every GID baked into
+`agent/app/services/taxonomy_map.py`**:
+
+```graphql
+{ taxonomy { categories(first:1, search:"Coffee Beans & Ground Coffee") { nodes {
+    id fullName
+    attributes(first:30) { nodes { __typename
+      ... on TaxonomyChoiceListAttribute { id name values(first:250) { nodes { id name } } } } } } } } }
+```
+
+| Attribute (`TaxonomyAttribute`) | value | canonical `TaxonomyValue` GID | in our map? |
+|---|---|---|---|
+| Coffee roast (1477) | Light | `…/19313` | ✓ (113's roast) |
+| Coffee roast (1477) | Medium-light | `…/7459` | ✓ (spike L1's reference) |
+| Coffee roast (1477) | Medium / Medium-dark / Dark / Other | `…/19314` / `…/9422` / `…/19315` / `…/26642` | ✓ |
+| Country (2364, 250 values) | Ethiopia | `…/8882` | ✓ |
+| Coffee product form (1977) | Whole bean | `…/8285` | — |
+| Decaffeination method (7731) | Swiss Water | `…/53270` | — |
+
+So the **canonical value→GID half is live-validated**; only the canonical→**metaobject-entry**
+hop remains unproven. Product 113 still has **zero** `shopify`-namespace metafields (no writes).
+
+## L7. Channel reality — **RESOLVED: the agentic channel EXISTS and 113 is published to it**
+
+Answers UNRESOLVED #3, and reverses L4's "UNKNOWN".
+
+```
+shop { plan } -> {"displayName":"Basic App Development",
+                  "partnerDevelopment":true,"shopifyPlus":false}
+```
+`shops.plan` is **reported only, deliberately not persisted** (the column stays NULL; its owner is
+the connect path — see `docs/backlog.md`).
+
+**Product 113 is published to Microsoft Copilot — an agentic surface:**
+```
+product(113) { resourcePublications } ->
+  Online Store       (Publication/350800085363)  isPublished:true
+  Microsoft Copilot  (Publication/350800118131)  isPublished:true
+  Point of Sale      (Publication/350800183667)  isPublished:true
+  Shop               (Publication/350800150899)  isPublished:true
+
+publication(id:"gid://shopify/Publication/350800118131") ->
+  {"name":"Microsoft Copilot","autoPublish":true,
+   "catalog":{"id":"gid://shopify/AppCatalog/185356321139","status":"ACTIVE",
+              "__typename":"AppCatalog"}}
+```
+
+> **TRAP — the agentic channel is NOT enumerable.** `publications(first:40)` returns **3** (Online
+> Store, Shop, Point of Sale) and **omits Microsoft Copilot**, under *every* `catalogType`
+> (`APP`/`NONE`/`MARKET`/`COMPANY_LOCATION`). `publicationsCount` = **3**; `catalogs(first:40)`
+> likewise omits the Copilot `AppCatalog` while `catalogsCount` = **4**. The publication resolves
+> perfectly by **direct ID** and appears in **`product.resourcePublications`** — it is simply
+> excluded from the collection queries. **Any code that discovers channels by enumerating
+> `publications` will conclude the agentic channel does not exist.** Go through
+> `product.resourcePublications`.
+>
+> (`resourcePublicationsCount` reported **3** while `resourcePublications` returned **4** nodes —
+> the count field is also not counting the agentic publication. Do not gate on that count.)
+
+**Plan-level consequence for Phase 4 — the L4 flag is now resolved in the POSITIVE direction:**
+a first-party Catalog/agentic round-trip **is** possible on this store — product 113 is live on
+Microsoft Copilot with `autoPublish: true`. Phase 4 uplift verification **may** use a
+publication-status round-trip, and is no longer forced onto the engine-query panel alone. It must
+still read that state per-product via `resourcePublications`, never by enumerating publications.
+
+## L8. Does `custom.*` reach Catalog? — **STILL UNRESOLVED; needs a live agentic query**
+
+Enumerating publications yields **no signal** about which product fields the channel ingests: the
+publication/catalog objects expose identity and publish-state only, not field mapping. Confirming
+whether a non-mapped `custom.*` metafield reaches Catalog still requires **a live agentic query
+against the provisioned channel** — it is not inferable from the Admin API. Left **UNRESOLVED, not
+inferred**, exactly as at L5. Largely moot: `custom.*` is retired as a write target.
+
+## Verdict — what this means for Step 4's Publisher
+
+**The §5 resolver contract is NOT confirmed live. It needs adjustment before Step 4 can build on
+it**, and the blocker is a scope, not a query shape:
+
+1. **The settled scope set is incomplete.** Add **`read_metaobject_definitions`** —
+   `read_metaobjects` alone is provably insufficient (this run). That is a **second merchant
+   re-consent**, and it is the precondition for re-probing the resolver.
+2. Only after that can the canonical→metaobject-entry hop be proven or refuted. If it still comes
+   back empty, the fallback question becomes whether the standard-taxonomy metaobjects must be
+   *enabled* on the shop first — and `standardMetaobjectDefinitionTemplates` is absent at 2026-07,
+   so that route would need an API-version decision.
+3. **Unblocked regardless:** the canonical value→`TaxonomyValue` GID map in `taxonomy_map.py` is
+   live-validated, and the `category` fix type (`productUpdate` with a scalar `TaxonomyCategory`
+   GID) was already proven writable at L1 — it needs no metaobject resolution.
+
+**No code changed. No writes.** The probe script was deleted after this record was written.
