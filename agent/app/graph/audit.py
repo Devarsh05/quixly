@@ -27,9 +27,9 @@ class AuditOutcome(BaseModel):
     audited: bool
     product_class: str
     severity: str
-    # Two coverage numbers, deliberately both: prose vs structured (see models.audit).
+    # Two channel-specific coverage numbers, both: prose vs taxonomy (see models.audit).
     spec_coverage: float | None
-    structured_coverage: float | None
+    taxonomy_coverage: float | None
     gaps: list[AuditGap]
     excluded_reason: str | None = None
 
@@ -63,7 +63,7 @@ async def run_audit(
         product_class=result.product_class,
         gaps_json=[gap.model_dump() for gap in result.gaps],
         spec_coverage=result.spec_coverage,
-        structured_coverage=result.structured_coverage,
+        taxonomy_coverage=result.taxonomy_coverage,
         severity=result.severity,
     )
     session.add(audit)
@@ -78,7 +78,7 @@ async def run_audit(
         product_class=result.product_class,
         severity=result.severity,
         spec_coverage=result.spec_coverage,
-        structured_coverage=result.structured_coverage,
+        taxonomy_coverage=result.taxonomy_coverage,
         gaps=result.gaps,
         excluded_reason=result.excluded_reason,
     )

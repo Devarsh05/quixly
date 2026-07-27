@@ -30,8 +30,16 @@ from app.models.base import Base
 
 
 class FixType(enum.StrEnum):
+    # ``metafield`` now means a TAXONOMY metafield (``shopify`` namespace,
+    # ``list.metaobject_reference``) — step 2d retired the ``custom.*`` write target. Its
+    # ``after_json`` carries the canonical ``taxonomy_value_gid`` + ``value``; the Step-4 Publisher
+    # resolves the per-shop metaobject-entry GID at write time (spike L1).
     metafield = "metafield"
     description = "description"
+    # ``category`` assigns a Standard-taxonomy product category (step 2d). It is the hard
+    # precondition for every taxonomy metafield write and is APPROVAL-GATED like a publish — a wrong
+    # category has real tax/channel consequences — so it is never bundled with low-risk fills.
+    category = "category"
     merchant_todo = "merchant_todo"
     # ``revert`` is added by step 4 (Publisher/rollback); the reverts_fix_id column exists now.
 

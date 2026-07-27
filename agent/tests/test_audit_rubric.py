@@ -1,25 +1,21 @@
-"""The per-class product-audit rubric (Phase 3, step 1 — Gate G).
+"""The per-class product-audit rubric (Phase 3, steps 1/2b — Gate G; 2d re-bake — Gate M).
 
 Pure, deterministic rule checks. The rubric is **per product class**:
 
-* spec scoring (roast/origin/process/variety/tasting notes/altitude/brew method) applies to
-  ``coffee`` only — the vocabulary is anchored to run-75's cited coffee-bean pages. ``equipment``
-  has no grounded vocabulary (run 75's panel is coffee-bean queries, so no cited equipment pages),
-  so equipment is NOT spec-scored; ``other`` is skipped too.
-* ``missing_gtin`` applies only to ``equipment`` (third-party manufactured goods carry a
-  manufacturer GTIN); self-roasted coffee is GTIN-not-applicable. GTIN presence is read from the
-  variant barcode — the single source of truth shared with the Optimizer.
-* not-discoverable products (draft/archived/unlisted) are EXCLUDED from the audit population and
-  reported separately — not scored and banded.
-* ``missing_metafields`` is a store-level finding, NOT a per-product gap, so it no longer inflates
-  per-product severity.
+* spec scoring (roast/origin/process/variety/tasting notes/altitude/brew method, + step-2d
+  coffee_product_form and — decaf-only — decaffeination_method) applies to ``coffee`` only.
+  ``equipment`` / ``other`` are not spec-scored.
+* ``missing_gtin`` applies only to ``equipment``; ``missing_description`` to any audited product.
+* not-discoverable products (draft/archived/unlisted) are EXCLUDED and reported separately.
 
-**Step 2b — the three-state model.** Every (product, family) is ``structured`` (in a metafield),
-``unstructured`` (in the prose only) or ``absent``. So there are two independent coverage numbers,
-and rich prose alone is no longer "optimized": it is a catalog full of *fixable* gaps. Severity is
-re-banded on state-weighted scores. Each state and each exclusion branch is seeded distinctly.
-
-Each branch is seeded distinctly.
+**Three-state model (unchanged since 2b).** Every (product, family) is ``structured`` /
+``unstructured`` / ``absent``. **Step 2d** changed only WHICH write makes a family ``structured``:
+its **taxonomy attribute** in the reserved ``shopify`` namespace (``shopify.coffee-roast`` etc.) —
+``custom.*`` no longer counts — and only the 4 taxonomy-home families can ever be structured. Two
+channel-specific coverage numbers, per-product denominators over APPLICABLE families:
+``spec_coverage`` = prose / applicable spec families (8, or 9 for decaf); ``taxonomy_coverage`` =
+taxonomy-written / applicable taxonomy-home families (3, or 4 for decaf). They are NOT blended.
+Each state and each exclusion branch is seeded distinctly.
 """
 
 import pytest
@@ -30,6 +26,7 @@ from app.services.audit_rubric import (
     SPEC_MISSING,
     STATE_ABSENT,
     STATE_UNSTRUCTURED,
+    applicable_families,
     evaluate_product,
     structured_families,
 )
@@ -40,6 +37,24 @@ RICH_BODY = (
     "Process: washed, 36-hour fermentation. Roast level: light (Agtron 68). Tasting notes: "
     "bergamot, jasmine, stone fruit. Brews beautifully as pour over or espresso."
 )
+
+# The 8 spec families APPLICABLE to a (non-decaf) coffee. decaffeination_method is decaf-only.
+_APPLICABLE = {
+    "roast_level", "origin", "process", "variety", "tasting_notes", "altitude", "brew_method",
+    "coffee_product_form",
+}
+# Families RICH_BODY states in prose — everything except coffee_product_form (no whole-bean/ground).
+_IN_PROSE = _APPLICABLE - {"coffee_product_form"}
+# Applicable taxonomy-home families (non-decaf): the taxonomy_coverage denominator = 3.
+_HOME = {"roast_level", "origin", "coffee_product_form"}
+
+# The reserved ``shopify`` taxonomy attribute handles — the ONLY way to make a family structured.
+_HANDLE = {
+    "roast_level": "coffee-roast",
+    "origin": "country",
+    "coffee_product_form": "coffee-product-form",
+    "decaffeination_method": "decaffeination-method",
+}
 
 
 def _variants(barcode: str | None = "0123456789012") -> list[dict]:
@@ -55,18 +70,13 @@ def _spec_attrs(result) -> set[str]:
 
 
 def _states(result, state: str) -> set[str]:
-    """The families the rubric tagged with ``state`` (its detect-based three-state proxy)."""
     return {g.attribute for g in result.gaps if g.code == SPEC_MISSING and g.state == state}
 
 
-_ALL_FAMILIES = {
-    "roast_level", "origin", "process", "variety", "tasting_notes", "altitude", "brew_method",
-}
-
-
-def _meta(*families: str, value: str = "x") -> list[dict]:
-    """Metafields KEYED to each family — the ``structured`` state."""
-    return [{"namespace": "custom", "key": f, "value": value} for f in families]
+def _struct(*families: str, value: str = "Light") -> list[dict]:
+    """Metafields in the ``shopify`` namespace keyed to each family's TAXONOMY handle — the only
+    ``structured`` state in step 2d. Only taxonomy-home families have a handle."""
+    return [{"namespace": "shopify", "key": _HANDLE[f], "value": value} for f in families]
 
 
 def _coffee(**overrides):
@@ -95,50 +105,76 @@ def _equipment(**overrides):
     return evaluate_product(**kwargs)
 
 
+# --- applicability: decaffeination_method is decaf-only --------------------------------------
+def test_decaf_method_applies_only_to_decaf_products():
+    assert "decaffeination_method" not in applicable_families("A washed Ethiopian coffee.")
+    assert "decaffeination_method" in applicable_families("Decaf, Swiss Water process.")
+    # the always-applicable new win is present regardless
+    assert "coffee_product_form" in applicable_families("A washed Ethiopian coffee.")
+
+
+def test_a_non_decaf_coffee_is_never_dinged_for_a_decaffeination_method():
+    result = _coffee()  # RICH_BODY, not decaf
+    assert "decaffeination_method" not in _spec_attrs(result)
+
+
+def test_a_decaf_coffee_scores_the_decaffeination_method_family():
+    # "decaf" makes the family applicable; Swiss Water is stated → unstructured (in prose).
+    result = _coffee(title="Decaf Colombia", body="Decaf, Swiss Water process. Medium roast.")
+    assert "decaffeination_method" in _states(result, STATE_UNSTRUCTURED)
+
+
 # --- coffee: the three-state model ----------------------------------------------------------
-def test_fully_structured_coffee_has_no_gaps():
-    """AI-legible means MACHINE-READABLE: every family in a metafield. This is the only state that
-    yields no gaps — prose alone no longer qualifies (see the next test)."""
-    result = _coffee(metafields=_meta(*_ALL_FAMILIES))
-    assert result.audited is True
-    assert result.gaps == []
-    assert result.severity == "none"
-    assert result.structured_coverage == 1.0
-
-
 def test_rich_prose_without_metafields_is_entirely_unstructured():
-    """The step-2b inversion: RICH_BODY states all seven families, which used to score a perfect
-    1.0 and zero gaps. It is now seven UNSTRUCTURED gaps — the addressable set, not a clean bill."""
+    """RICH_BODY states 7 of the 8 applicable families in prose; none is in a taxonomy attribute.
+    So it is 7 UNSTRUCTURED gaps + 1 ABSENT (coffee_product_form, not stated) — the addressable
+    set, not a clean bill. taxonomy_coverage is 0.0 (the headline channel is empty)."""
     result = _coffee()  # metafields=None
-    assert result.spec_coverage == 1.0        # prose: everything is stated
-    assert result.structured_coverage == 0.0  # structured: nothing is machine-readable
-    assert _states(result, STATE_UNSTRUCTURED) == _ALL_FAMILIES
-    assert _states(result, STATE_ABSENT) == set()
+    assert result.spec_coverage == len(_IN_PROSE) / len(_APPLICABLE)  # 7/8 prose
+    assert result.taxonomy_coverage == 0.0                            # nothing in the taxonomy
+    assert _states(result, STATE_UNSTRUCTURED) == _IN_PROSE
+    assert _states(result, STATE_ABSENT) == {"coffee_product_form"}
+
+
+def test_taxonomy_home_families_structured_lifts_only_taxonomy_coverage():
+    """A coffee can never reach ``none`` — the 5 non-taxonomy families have no structured channel —
+    but writing the 3 applicable taxonomy-home attributes drives taxonomy_coverage to 1.0 and drops
+    those families from the gaps entirely."""
+    result = _coffee(metafields=_struct("roast_level", "origin", "coffee_product_form"))
+    assert result.taxonomy_coverage == 1.0
+    assert _spec_attrs(result) & _HOME == set()          # the 3 taxonomy-home families: no gap
+    # the 5 non-taxonomy families remain (unstructured, since RICH_BODY states them all)
+    assert _states(result, STATE_UNSTRUCTURED) == {
+        "process", "variety", "tasting_notes", "altitude", "brew_method"
+    }
+    assert result.severity == "medium"  # 5 unstructured * 1 = 5
 
 
 def test_three_state_split_separates_unstructured_from_absent():
     body = (
         "Single-origin washed Arabica from Ethiopia. Altitude 2,000 masl. Varietal: Heirloom. "
         "Process: washed. Roast level: light. Tasting notes: bergamot."
-    )  # six families in prose; no brew-method language anywhere
-    result = _coffee(body=body, metafields=_meta("origin"))
-    # origin is in a metafield -> structured -> no gap at all.
+    )  # 6 families in prose; no brew-method / product-form language anywhere
+    result = _coffee(body=body, metafields=_struct("origin", value="Ethiopia"))
+    # origin is in its taxonomy attribute -> structured -> no gap at all.
     assert "origin" not in _spec_attrs(result)
-    # Stated in prose but not structured -> fixable.
     assert _states(result, STATE_UNSTRUCTURED) == {
         "roast_level", "process", "variety", "tasting_notes", "altitude",
     }
     # Stated nowhere -> a merchant must supply it.
-    assert _states(result, STATE_ABSENT) == {"brew_method"}
-    assert result.spec_coverage == 6 / 7
-    assert result.structured_coverage == 1 / 7
+    assert _states(result, STATE_ABSENT) == {"brew_method", "coffee_product_form"}
+    assert result.spec_coverage == 6 / 8         # 6 of 8 applicable stated in prose
+    assert result.taxonomy_coverage == 1 / 3     # origin of the 3 taxonomy-home families
 
 
-def test_the_difference_between_the_two_numbers_is_the_addressable_set():
-    """The finding this step exists to produce: high prose coverage, zero structured coverage."""
-    result = _coffee()
-    addressable = _states(result, STATE_UNSTRUCTURED)
-    assert result.spec_coverage - result.structured_coverage == len(addressable) / 7
+def test_custom_namespace_metafields_are_not_structured():
+    """The step-2d flip: a ``custom.*`` metafield — including the ones the pre-2d Optimizer wrote —
+    is NOT the AI-legible channel, so it does not count as structured and does not lift the headline
+    number. Only the reserved ``shopify`` taxonomy attribute does."""
+    custom = [{"namespace": "custom", "key": "roast_level", "value": "Light"}]
+    result = _coffee(body="A lovely coffee.", metafields=custom)
+    assert "roast_level" in _spec_attrs(result)   # still a gap
+    assert result.taxonomy_coverage == 0.0
 
 
 def test_coffee_blank_body_flags_missing_description():
@@ -146,44 +182,52 @@ def test_coffee_blank_body_flags_missing_description():
 
 
 def test_coffee_never_gets_missing_gtin_even_without_a_barcode():
-    # Self-roasted coffee is GTIN-not-applicable — no barcode is not a gap.
     result = _coffee(variants=_variants(None))
     assert MISSING_GTIN not in _codes(result)
 
 
 # --- structured_families: the single classifier both the rubric and the Optimizer read ---------
-def test_structured_family_is_keyed_by_the_metafield_key_not_its_value():
-    """A family is structured because a metafield NAMES it, not because prose happens to appear in
-    some metafield's value. A roast value filed under an unrelated key is not machine-readable."""
-    assert structured_families([{"key": "roast_level", "value": "Light"}]) == {"roast_level"}
-    assert structured_families([{"key": "internal_note", "value": "light roast"}]) == set()
+def test_structured_family_is_keyed_by_the_shopify_taxonomy_handle():
+    assert structured_families(
+        [{"namespace": "shopify", "key": "coffee-roast", "value": "Light"}]
+    ) == {"roast_level"}
+    assert structured_families(
+        [{"namespace": "shopify", "key": "country", "value": "Ethiopia"}]
+    ) == {"origin"}
+    assert structured_families(
+        [{"namespace": "shopify", "key": "decaffeination-method", "value": "Swiss Water"}]
+    ) == {"decaffeination_method"}
 
 
-def test_structured_family_accepts_merchant_key_aliases_and_ignores_namespace():
-    # The Optimizer writes custom.<family>; merchants use their own namespace and wording.
-    assert structured_families([{"namespace": "custom", "key": "roast", "value": "Light"}]) == {
-        "roast_level"
-    }
-    assert structured_families([{"namespace": "my_fields", "key": "varietal", "value": "Gesha"}]) \
-        == {"variety"}
+def test_only_the_shopify_namespace_counts_as_structured():
+    # The taxonomy channel is the RESERVED shopify namespace. A merchant's own namespace does not
+    # make a family machine-legible, even keyed to the handle.
+    assert structured_families([{"namespace": "custom", "key": "coffee-roast", "value": "Light"}]) \
+        == set()
+    assert structured_families([{"namespace": "custom", "key": "roast_level", "value": "Light"}]) \
+        == set()
+    assert structured_families([{"namespace": "my_fields", "key": "country", "value": "Peru"}]) \
+        == set()
+
+
+def test_non_taxonomy_families_can_never_be_structured():
+    # process / variety / altitude / brew_method / tasting_notes have no taxonomy attribute, so no
+    # metafield can ever mark them structured — their legible ceiling is the description.
+    for key in ("process", "variety", "altitude", "brew-method", "tasting-notes", "flavor"):
+        assert structured_families([{"namespace": "shopify", "key": key, "value": "x"}]) == set()
 
 
 def test_empty_metafield_value_is_not_structured():
-    """A key with no value is not machine-readable. Counting it would BOTH inflate the headline
-    score and silently drop a real gap from the Optimizer's targets."""
-    assert structured_families([{"key": "roast_level", "value": "   "}]) == set()
-    assert structured_families([{"key": "roast_level", "value": None}]) == set()
-    assert structured_families([{"key": "roast_level"}]) == set()
-    # ...and the rubric agrees: the family is still a gap.
-    result = _coffee(body="A lovely coffee.", metafields=[{"key": "roast_level", "value": ""}])
+    assert structured_families([{"namespace": "shopify", "key": "coffee-roast", "value": "  "}]) \
+        == set()
+    assert structured_families([{"namespace": "shopify", "key": "coffee-roast", "value": None}]) \
+        == set()
+    assert structured_families([{"namespace": "shopify", "key": "coffee-roast"}]) == set()
+    result = _coffee(
+        body="A lovely coffee.",
+        metafields=[{"namespace": "shopify", "key": "coffee-roast", "value": ""}],
+    )
     assert "roast_level" in _spec_attrs(result)
-
-
-def test_generic_keys_do_not_false_positive_as_a_spec_family():
-    """Aliases are curated, not taken from the open-kind ``labels`` (which include generic terms
-    like "notes"/"aroma"/"masl"). A false ``structured`` is the dangerous direction."""
-    assert structured_families([{"key": "notes", "value": "call the supplier"}]) == set()
-    assert structured_families([{"key": "aroma", "value": "nice"}]) == set()
 
 
 def test_structured_families_tolerates_malformed_metafields():
@@ -192,27 +236,26 @@ def test_structured_families_tolerates_malformed_metafields():
     assert structured_families(["not-a-dict", {"value": "no key"}]) == set()
 
 
-def test_metafields_removes_the_family_from_the_gaps_entirely():
-    result = _coffee(body="A lovely coffee.", metafields=_meta("roast_level"))
+def test_taxonomy_metafield_removes_the_family_from_the_gaps_entirely():
+    result = _coffee(body="A lovely coffee.", metafields=_struct("roast_level"))
     assert "roast_level" not in _spec_attrs(result)
-    assert result.structured_coverage == 1 / 7
+    assert result.taxonomy_coverage == 1 / 3
 
 
 # --- equipment ------------------------------------------------------------------------------
 def test_equipment_is_not_spec_scored():
-    result = _equipment(body="")  # nothing coffee-ish at all
+    result = _equipment(body="")
     assert result.spec_coverage is None
+    assert result.taxonomy_coverage is None
     assert not any(g.code == SPEC_MISSING for g in result.gaps)
 
 
 def test_equipment_without_a_barcode_flags_missing_gtin():
-    result = _equipment(variants=_variants(None))
-    assert MISSING_GTIN in _codes(result)
+    assert MISSING_GTIN in _codes(_equipment(variants=_variants(None)))
 
 
 def test_equipment_with_a_barcode_has_no_gtin_gap():
-    result = _equipment(variants=_variants("0123456789012"))
-    assert MISSING_GTIN not in _codes(result)
+    assert MISSING_GTIN not in _codes(_equipment(variants=_variants("0123456789012")))
 
 
 # --- other / unset --------------------------------------------------------------------------
@@ -228,11 +271,8 @@ def test_other_class_is_not_spec_scored_and_has_no_gtin_gap():
 
 @pytest.mark.parametrize("product_type", ["Whole Bean", "Merch", "", None])
 def test_unknown_product_type_falls_back_to_unset_not_coffee_vocabulary(product_type):
-    """Full chain: an unmapped/empty/NULL productType classifies to the UNSET class ("other") and
-    is NOT spec-scored — the classifier never guesses the coffee vocabulary for unknown data."""
     product_class = classify_product(product_type, None)
     assert product_class == "other"
-
     result = evaluate_product(
         title="Something", body="", variants=_variants(None), metafields=None,
         visibility_state="active", product_class=product_class,
@@ -249,9 +289,8 @@ def test_draft_archived_unlisted_are_excluded_not_scored():
         assert result.excluded_reason == "not_visible"
         assert result.severity == "not_audited"
         assert result.gaps == []
-        # BOTH coverage numbers are NULL for an excluded product — never a misleading 0.0.
         assert result.spec_coverage is None
-        assert result.structured_coverage is None
+        assert result.taxonomy_coverage is None
 
 
 def test_active_and_null_visibility_are_audited():
@@ -261,73 +300,50 @@ def test_active_and_null_visibility_are_audited():
 
 # --- metafields are store-level, never a per-product gap ------------------------------------
 def test_empty_metafields_never_produce_a_per_product_gap():
-    result = _coffee(metafields=None)
-    assert "missing_metafields" not in _codes(result)
-    result2 = _equipment(metafields=[])
-    assert "missing_metafields" not in _codes(result2)
+    assert "missing_metafields" not in _codes(_coffee(metafields=None))
+    assert "missing_metafields" not in _codes(_equipment(metafields=[]))
 
 
 # --- spec_coverage is PROSE-only -------------------------------------------------------------
 def test_metafield_values_do_not_count_toward_prose_coverage():
-    """Metafield values are the STRUCTURED channel. If they also fed prose coverage, a structured
-    family would raise both numbers and their difference — the addressable set — would collapse."""
     result = _coffee(
         title="Mystery Beans",  # spec-neutral, so prose contributes nothing on its own
         body="A lovely coffee.",
-        metafields=[{"key": "roast_level", "value": "light roast, Agtron 68"}],
+        metafields=_struct("roast_level", value="light roast, Agtron 68"),
     )
-    assert result.structured_coverage == 1 / 7
+    assert result.taxonomy_coverage == 1 / 3
     # "light roast" lives only in the metafield, so prose coverage must NOT see it.
     assert result.spec_coverage == 0.0
 
 
-# --- severity banding (step 2b re-baseline; Gate G re-approved) -------------------------------
+# --- severity banding (2d re-bake; Gate M) --------------------------------------------------
 def test_empty_coffee_is_high():
-    # A spec-neutral title so nothing (not even origin from "Ethiopia") is picked up.
     result = _coffee(title="Mystery Beans", body=None)
-    # missing_description (4) + 7 absent (7*2=14) = 18 -> high
+    # missing_description (4) + 8 absent (8*2=16) = 20 -> high
     assert result.severity == "high"
     assert result.spec_coverage == 0.0
-    assert result.structured_coverage == 0.0
+    assert result.taxonomy_coverage == 0.0
 
 
 def test_mostly_absent_coffee_is_high():
-    # 2 in prose (unstructured, 1 each), 5 absent (2 each) -> 2 + 10 = 12 -> high.
+    # roast + origin in prose (unstructured, 1 each); 6 absent (2 each) -> 2 + 12 = 14 -> high.
     result = _coffee(body="Medium roast, single-origin Ethiopia.")
-    assert result.spec_coverage == 2 / 7
+    assert result.spec_coverage == 2 / 8
     assert result.severity == "high"
 
 
-def test_mostly_unstructured_coffee_is_only_medium():
-    """Weighting is state-based: prose-stated specs are auto-fixable, so a rich-prose product is
-    materially better off than an empty one even though neither is machine-readable."""
-    body = (
-        "Single-origin washed Arabica from Ethiopia. Altitude 2,000 masl. Varietal: Heirloom. "
-        "Process: washed. Roast level: light. Tasting notes: bergamot."
-    )
-    # 6 unstructured (6) + 1 absent (2) = 8 -> medium
-    assert _coffee(body=body).severity == "medium"
-
-
 def test_unstructured_scores_strictly_better_than_absent():
-    """The ordering that gives the bands their meaning: prose-stated specs are auto-fixable, so a
-    product whose families are merely unstructured must band strictly better than one where the
-    same families are absent. Both are equally un-machine-readable (structured_coverage 0.0), so
-    only the state weighting separates them."""
-    in_prose = _coffee()  # RICH_BODY: all seven stated in prose
+    """Prose-stated specs are auto-fixable, so a product whose families are merely unstructured
+    must band strictly better than one where the same families are absent. Both have
+    taxonomy_coverage 0.0, so only the state weighting separates them."""
+    in_prose = _coffee()  # RICH_BODY: 7 stated in prose, 1 absent
     nowhere = _coffee(title="Mystery Beans", body="A coffee.")  # none stated anywhere
-    assert _states(in_prose, STATE_UNSTRUCTURED) == _ALL_FAMILIES
-    assert _states(nowhere, STATE_ABSENT) == _ALL_FAMILIES
-    assert in_prose.structured_coverage == nowhere.structured_coverage == 0.0
-
+    assert in_prose.taxonomy_coverage == nowhere.taxonomy_coverage == 0.0
     bands = ["none", "low", "medium", "high"]
     assert bands.index(in_prose.severity) < bands.index(nowhere.severity)
 
 
 def test_equipment_missing_gtin_is_still_medium_on_its_own():
-    """Pins the step-1 intent the re-baseline preserved: missing_gtin was scaled with the spec
-    weights (3->6) so a manufactured good lacking its GTIN still lands at medium by itself. At the
-    un-scaled weight it would have silently demoted to low."""
     result = _equipment(variants=_variants(None))
     assert result.gaps and all(g.code == MISSING_GTIN for g in result.gaps)
     assert result.severity == "medium"
@@ -344,9 +360,8 @@ def test_result_is_deterministic():
 
 
 def test_the_audit_path_makes_no_llm_call():
-    """Gate G's core claim, pinned. The three-state split is tempting to compute with the
-    Optimizer's extractor — that would make severity nondeterministic and unreproducible. The
-    rubric must reach its split with the detect-based proxy and nothing else."""
+    """Gate G's core claim, pinned: the three-state split is reached with the detect-based proxy and
+    nothing else — no LLM, so severity stays deterministic and reproducible."""
     import inspect
 
     from app.services import audit_rubric
@@ -354,5 +369,4 @@ def test_the_audit_path_makes_no_llm_call():
     source = inspect.getsource(audit_rubric)
     for banned in ("optimizer_llm", "extractor_llm", "httpx", "openai", "await "):
         assert banned not in source, f"the audit path must not reference {banned!r}"
-    # No client can even be passed in.
     assert "client" not in inspect.signature(audit_rubric.evaluate_product).parameters

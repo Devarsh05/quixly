@@ -130,6 +130,9 @@ they **break the chain and force the merchant to reinstall**.
   Publishing flows through `fixes.status = approved` only.
 - **Never fabricate product attributes, specs, GTINs, or reviews.** Optimizer may only
   enrich/restructure from verified source data; every fix carries a before/after diff + source.
+- **Category assignment is a publish-class write.** Assigning a Standard-taxonomy category (the
+  `category` fix type) has tax/channel consequences and is approval-gated like a store publish —
+  never bundled as a low-risk metafield. It is the precondition for every taxonomy attribute write.
 - **Schema ownership.** `shopify` schema = Prisma (`Session` + `_prisma_migrations`).
   `public` = Alembic (everything else). **Neither tool may touch the other's.** Do NOT set
   `version_table_schema` in Alembic's `env.py` — it disables Alembic's self-exclusion and
@@ -167,6 +170,94 @@ they **break the chain and force the merchant to reinstall**.
 ## Conventions
 - Monorepo; keep `app/` and `agent/` independently runnable.
 - Agent graph nodes live in `agent/app/graph/` — one file per node.
+- **Optimizer write channels (step 2d) — `custom.*` is RETIRED as a write target.** The
+  AI-legibility channels are exactly two: **taxonomy attributes** (`shopify` namespace,
+  `list.metaobject_reference`) for the four **taxonomy-home** families — `coffee-roast`, `country`
+  (origin), `coffee-product-form`, `decaffeination-method` — and the product **description** (the
+  HTML-preserving append-list composer `_compose_description`) for every other grounded family.
+  Never reintroduce a `custom.*` write unless the L5 Catalog-ingestion question (does Catalog read
+  non-mapped `custom.*`?) resolves **positive** — see `docs/decisions/2c-write-target.md`.
+- **Negative claims must be grounded (Optimizer).** A merchant to-do is an assertion about the
+  product, and a false one survives the approval gate because it reads as advice, not a diff. So
+  absence is guarded exactly like presence. An **"absent" to-do is permitted only when** no
+  `SPEC_VOCABULARY` token for the family is literally present in **any** source field **and** the
+  deterministic audit did not classify that family `unstructured` (`audits.gaps_json[].state`).
+  **Extraction returning nothing is NOT evidence of absence** — it is routinely a flaky-LLM miss, so
+  before any family is written off, `audit_rubric.recover_spec_value` tries to read the value
+  straight out of source with no LLM. Recovery **proposes** into the unchanged `ground_attribute` +
+  `validate_spec_value` guards — it is never a second, weaker path into a fix. A family that is
+  mentioned but yields no readable value gets the truthful `mentioned_no_value` to-do tier (which
+  carries its evidence), never an absence claim. The audit is the **authority for absence** and only
+  ever raises the bar, never lowers it. **One vocabulary, no fork:** `SPEC_FAMILIES` is the single
+  definition; `detect` (via `detect_hit`) answers presence, `values`/`kind` (via
+  `validate_spec_value`) answer validity. Cross-family-ambiguous value phrases (today exactly
+  `espresso`, a roast AND a brew method) are refused by recovery for both families — never trade a
+  false negative for a false positive. (Observed: run 839 shipped 14 false absence claims across 9
+  products before this guard.)
+- **Gap→row accounting (Optimizer).** Every family in the Optimizer's `spec_targets` resolves to
+  **exactly one** of {taxonomy metafield fill, description line, merchant to-do}, pairwise disjoint
+  — asserted in `run_optimizer` before persist. A target producing **zero** rows is always a
+  routing bug. Stated over `spec_targets` (extraction-based), **not** `audit.gaps_json` (the
+  deterministic detect proxy, which is allowed to diverge from extraction).
+- **The Optimizer is Shopify-free.** It makes no live Shopify calls. A taxonomy fix carries the
+  canonical `TaxonomyValue` GID at propose-time; the **value → per-shop-metaobject-entry-GID**
+  resolution is **publish-time** (the Publisher, Step 4). That resolution is currently **unproven
+  and blocked** — see the metaobject-scope note below. Propose-time behaviour is unaffected: the
+  canonical GID it carries is live-validated.
+- **Taxonomy write mechanics.** A taxonomy attribute write needs a **per-shop metaobject-entry
+  GID**, NOT the canonical `TaxonomyValue` GID (Shopify rejects the latter with `INVALID_VALUE`).
+  The standard-taxonomy metaobject surface is invisible **even with `read_metaobjects` granted** —
+  the blocker is `read_metaobject_definitions` (next bullet). Evidence:
+  `docs/decisions/2c-write-target.md` (L1/L2/L6).
+- **Audit coverage = two channel-specific numbers, never blended.** `audits.taxonomy_coverage`
+  (headline machine-readable score, over applicable **taxonomy-home** families — 3, or 4 for a
+  decaf product) and `audits.spec_coverage` (prose channel, over applicable spec families — 8, or 9
+  for decaf). The old `structured_coverage` (which counted `custom.*`) is **DROPPED** (migration
+  `c1f2a3b4d5e6`). Three-state classification (structured/unstructured/absent) is unchanged — only
+  *which write makes a family `structured`* moved (taxonomy attribute, not `custom.*`).
+- **Shopify scope set — GRANTED; the taxonomy write path is BLOCKED, and the blocker is a SCOPE,
+  not a query shape.** `app/shopify.app.toml` declares `write_products + read_metaobjects +
+  read_publications` (granted 2026-07-27; `read_products` is implied by `write_products`). Scopes
+  are owned by **Shopify managed installation**, so the toml is the single source of truth —
+  `app/app/shopify.server.ts` deliberately leaves `scopes` undefined and `SCOPES` unset; do not set
+  either. Editing that line triggers a merchant consent on next app load.
+  The two metaobject scopes are **distinct and both required**:
+  - **`read_metaobjects`** (instance-level, **GRANTED**) reads metaobject **entries** — but only if
+    you already know the `type` string.
+  - **`read_metaobject_definitions`** (schema-level, **NOT granted**) is what enumerates
+    `metaobjectDefinitions` and thus **discovers** that `type` string. Without it the definition
+    surface returns `[]` *even with `read_metaobjects`*, so the `metaobjects` query cannot be
+    aimed. Confirmed live after the grant (L6) — the surface was still empty.
+  - **`standardMetaobjectDefinitionTemplates` does not exist on `QueryRoot` at API `2026-07`**
+    despite current docs describing it, so the documented "enable a standard definition" route is
+    unavailable at our pin.
+  **Consequence:** the taxonomy metafield write path needs a **third merchant consent** (install →
+  the 2026-07-27 grant → `read_metaobject_definitions`) **AND** proof the entry surface populates
+  end-to-end before that consent is spent. **Deferred — see `docs/backlog.md`.** The canonical half
+  IS proven: every GID in `agent/app/services/taxonomy_map.py` validates against the live
+  `taxonomy` root (L6). `read_publications` does NOT resolve `shops.plan` (that comes off
+  `shop { plan { … } }`); it is what makes publication state readable.
+- **Channel discovery: use `resourcePublications`, NEVER `publications`.** The agentic channel
+  (Microsoft Copilot) is an ACTIVE publication on the dev store with `autoPublish: true` and
+  product 113 published to it — yet `publications(first:40)` returns **3** and **omits it under
+  every `catalogType`**, and `catalogs` likewise omits its `AppCatalog`. Both collection queries
+  agree with their own count fields (`publicationsCount` 3, `catalogsCount` 4) — they are
+  *consistently* blind, so **no count-vs-list mismatch warns you**. **Any code that discovers
+  channels by enumerating `publications` will silently conclude the agentic channel does not
+  exist**, with no error raised. Discover channel membership via `product.resourcePublications`;
+  resolve known channels by **direct ID**.
+  **Never gate on a count field:** for product 113, `resourcePublications` returns **4 nodes
+  (including Copilot)** while `resourcePublicationsCount` reports **3** — the count omits the
+  agentic publication that the list itself returns. This matters most for **Phase 4's Verifier**.
+  Evidence: L7.
+- **Proven write paths for the Publisher (Step 4) — build on these NOW.**
+  - **`category` fix** — a scalar `TaxonomyCategory` GID via `productUpdate`. **Proven writable**
+    (L1); involves no metaobject, so it is *not* blocked. Still approval-gated as a publish-class
+    write.
+  - **`description` fix** — reaches all 9 families, needs **no extra scope**, and is the field the
+    Copilot agentic channel reads. **This is the primary legibility channel**, not a fallback.
+  - **taxonomy metafield fix** — **BLOCKED** on `read_metaobject_definitions` (above). Deferred.
+  `shops.plan` stays NULL; its owner is the connect/ingest path, never a diagnostic (backlog).
 - **`products.visibility_state` has ONE normalizer** — `normalize_visibility_state` in
   `agent/app/services/catalog.py`, used by BOTH writers (the ingest job and the `products/update`
   webhook). Case-insensitive (GraphQL yields UPPERCASE, webhooks lowercase); maps
@@ -219,14 +310,37 @@ Only items confirmed by committed code or a session log are checked.
 - [x] Read-only report UI: embedded audit page + agent client `startScan` / `getReport`
 - [x] Gate F — live webhook verification: `products/update` (HMAC + DB write) & `app/uninstalled` (status flip); topic-dispatch fix `f0b97bc`; reinstall + re-ingest 20/20
 
-### Phase 3 — Fix — not started
-- [ ] Product audit (per-product gaps vs. grounded source data)
-- [ ] Grounded Optimizer (description + JSON-LD + metafields/GTIN), before/after diff + source per fix
-- [ ] Preview/approve UI behind the mandatory approval gate (`fixes.status = approved`)
-- [ ] Publisher (Admin API writes) — dev store only first, re-read + parse-check after publish
+### Phase 3 — Fix — Optimizer complete; approval UI + Publisher remain
+- [x] Product audit — per-product, per-class rubric; three-state spec model
+      (structured/unstructured/absent); two channel-specific coverage numbers. Gate G, re-baked as
+      Gate M when the family set grew 7→9 (added `coffee-product-form`, `decaffeination-method`)
+- [x] Write-target spike — proved the AI-legibility channel is taxonomy + description, not
+      `custom.*`; settled the GID form and the two scope walls (`docs/decisions/2c-write-target.md`)
+- [x] Grounded Optimizer — structural targeting; taxonomy-attribute / description / `category`
+      routing (`custom.*` retired); grounding guard + gap→row accounting invariant; demo seed
+      retired (Gates H/L/M). Before/after diff + source per fix
+- [x] Negative grounding (step 2e) — absence claims are guarded like fills: deterministic recovery
+      + negative literal-presence guard + the `mentioned_no_value` to-do tier. Run 839's 14 false
+      absence claims → 0, and 0 even when extraction grounds nothing at all
+- [x] Step 4-preamble — `read_metaobjects` + `read_publications` granted (`6b9b17a`); channel
+      reality RESOLVED (Copilot active, 113 published); canonical GID map live-validated. Resolver
+      contract **NOT confirmed** — blocked on `read_metaobject_definitions`
+      (`docs/decisions/2c-write-target.md` L6/L7)
+- [ ] Preview/approve UI behind the mandatory approval gate (`fixes.status = approved`) — Step 3
+- [ ] Publisher (Admin API writes) — dev store only first, re-read + parse-check after publish —
+      Step 4. Ships on **`category` + `description`, both proven writable**. The **taxonomy
+      metafield** path is deferred — blocked on a third merchant consent plus an unproven
+      metaobject surface (see backlog)
 
 ### Phase 4 — Verify — not started
-- [ ] Verifier loop
+- [ ] Verifier loop. **A first-party channel EXISTS — uplift verification is NOT forced onto the
+      engine panel alone** (2026-07-27, reversing the earlier UNKNOWN): the dev store carries an
+      ACTIVE Microsoft Copilot agentic publication with product 113 published to it, so a
+      Catalog/agentic round-trip is possible. The **description** field — which Copilot reads — is
+      the proven-writable legibility channel. Read membership via `product.resourcePublications`;
+      enumeration hides the channel (see Conventions). Evidence: `2c-write-target.md` L7.
+      (L5 — whether non-mapped `custom.*` reaches Catalog — remains unresolved and needs a live
+      agentic query; moot since `custom.*` is retired)
 - [ ] Uplift chart
 - [ ] Scheduled weekly scans (also keep the refresh chain warm)
 - [ ] Browserbase shopping-agent simulation
@@ -237,9 +351,11 @@ Only items confirmed by committed code or a session log are checked.
 - [ ] App Store submission (incl. compliance webhooks `customers/data_request`/`redact`, `shop/redact`)
 - [ ] MCP server
 
-**Next action:** Phase 3 begins with a **plan-first** design of the grounded Optimizer + Publisher
-(Admin API writes) behind the mandatory approval gate — Phase 3 is the first phase that writes to
-live merchant stores, so no code before an approved plan.
+**Next action:** the Optimizer half of Phase 3 is complete, the false "absent" to-do blocker is
+closed (step 2e), and the scope grant + live diagnostic are done (step 4-preamble). **Step 3
+(approval UI) is unblocked** and is the next build. **Step 4 ships on `category` + `description`**;
+the taxonomy metafield path is deferred behind a spike + third consent (see backlog). Both remain
+**plan-first**, as the first code that writes to live merchant stores.
 
 ## Session Log
 

@@ -25,6 +25,19 @@ the phase by which it should be revisited.
 
 ## Extractor
 
+- **`gpt-5-nano` / `reasoning_effort=minimal` is flaky on title-resident attribute extraction.**
+  The Optimizer's extraction client misses specs that are literally in the product title — run 839
+  returned nothing for `origin` on *"Ethiopia Yirgacheffe 340 g"*. Step 2e made the pipeline
+  **robust to** this (deterministic recovery + the negative grounding guard, so a miss can no longer
+  become a false merchant-facing claim), but it did **not** fix the flakiness itself: a miss still
+  costs the *taxonomy* fill wherever the deterministic scanner cannot recover a value — notably
+  `tasting_notes` (open-vocabulary, never recovered) and any value needing sentence context rather
+  than a token. Measured worst case: with extraction returning nothing at all, 29 of the catalog's
+  families recover deterministically and the rest degrade to honest to-dos. Candidate work: raise
+  `reasoning_effort`, retry-on-empty for families the audit says are `unstructured`, or a
+  larger model for the extraction step — decide before Phase 4 sets a quality bar on fill rate.
+  _Raised: 2026-07-27 (Phase 3 step 2e; split out of the resolved Optimizer false-to-do entry)._
+
 - **`verbatim` is DISCARDED, not stored — and returns the whole answer.** Two problems, corrected
   here: (1) the extractor model populates each `ExtractedBrand.verbatim` with the **full answer
   text** rather than the brand's local snippet; and (2) the Extractor does **not persist verbatim at
@@ -33,6 +46,59 @@ the phase by which it should be revisited.
   grounding today — `_is_grounded` matches on the brand **name**, not `verbatim`. But consuming
   verbatim later (e.g. an answer-snippet evidence join) requires BOTH persisting it AND narrowing it
   to the brand's local sentence/window. _Raised: 2026-07-17; corrected: 2026-07-22._
+
+## Optimizer
+
+- **RESOLVED (2026-07-27, Phase 3 step 2e): the false "absent" to-do is fixed; negative claims are
+  now grounded.** The Optimizer emitted merchant to-dos claiming a spec was absent whenever
+  extraction flakily missed it — e.g. run 839 `spec:origin` "No origin stated in any source field"
+  on product 113, title *"Ethiopia Yirgacheffe 340 g"*, contradicting both the literal title and the
+  audit's own `unstructured` classification. **Root cause:** positive claims (fills) were grounded
+  by literal presence; negative claims were not — and extraction returning nothing is not evidence
+  of absence. The bug was **systemic, not a one-off**: re-checking run 839's persisted rows found
+  **14 false absence claims across 9 products and 6 families** (origin ×8, brew_method ×2,
+  process, roast_level, coffee_product_form).
+  **Fix (three parts, all Optimizer-side — the audit was right and is unchanged):**
+  (1) deterministic **recovery** (`audit_rubric.recover_spec_value`) reads the value straight out of
+  source with no LLM before any family is written off; (2) a **negative literal-presence guard**
+  permits the absence claim only when no `SPEC_VOCABULARY` token is in ANY source field **and** the
+  audit did not classify the family `unstructured`; (3) a third truthful to-do tier
+  (`mentioned_no_value`) for "mentioned but no value readable", which carries its evidence. The
+  gap→row accounting invariant is unchanged — recovery only moves a family between existing routes.
+  **Evidence:** run 873 (real LLM) → 0 false claims of 69; and with a stub extractor grounding
+  *nothing at all* on all 18 products, 29 families still recover and false claims stay **0**.
+  _Raised: 2026-07-27 (step 2d acceptance, run 839); resolved: 2026-07-27._
+
+## Taxonomy write path (Step 4)
+
+- **DEFERRED — blocked on a scope AND an unproven surface.** The canonical
+  value→`TaxonomyValue`-GID half is **proven** (`agent/app/services/taxonomy_map.py` validates
+  against the live `taxonomy` root). The canonical→**per-shop-metaobject-entry-GID** hop is
+  **untested**, because the metaobject *definition* surface is invisible without
+  **`read_metaobject_definitions`** — a scope outside the currently granted set, requiring a
+  **third merchant consent**.
+  **Before spending that consent on a real merchant**, an isolated spike must prove end-to-end on
+  the dev store: grant `read_metaobject_definitions` → confirm the definition surface actually
+  **POPULATES** (it may be empty even with the scope on this store tier) → resolve one
+  canonical→entry GID → write it → re-read confirms. Only if that spike passes does the taxonomy
+  write path become buildable. **If the surface stays empty with both scopes, taxonomy attributes
+  may not be app-writable on this tier** — a real possible outcome, and cheap to learn via probe.
+  Until then **Step 4 ships on `category` + `description` (both proven)**.
+  The Optimizer may keep **proposing** taxonomy fixes — they are grounded, correct, and publishable
+  the moment the path unblocks — **but the approval UI must not offer an approve that leads to a
+  write that cannot execute.** Raw evidence: `docs/decisions/2c-write-target.md` → L6.
+  _Raised: 2026-07-27 (Phase 3 step-4-preamble, L6)._
+
+## Shop record
+
+- **`shops.plan` has no writer — nobody populates it.** The column exists and is NULL for the only
+  shop. Its value is readable live (`shop { plan { displayName partnerDevelopment shopifyPlus } }`
+  → `"Basic App Development"`, `partnerDevelopment: true` on the dev store, confirmed 2026-07-27),
+  but the step-4-preamble diagnostic deliberately **reported without persisting** — a one-off
+  UPDATE would be stale the moment the merchant changes plan. Decide the owner: most naturally the
+  **connect path** (`afterAuth` → agent `connectShop`) or catalog ingest, so it refreshes on every
+  reinstall/scan. Needed before anything gates behavior on plan (billing tiers, Phase 5).
+  _Raised: 2026-07-27 (Phase 3 step-4-preamble)._
 
 ## Token custody / refresh locking
 

@@ -121,11 +121,15 @@ async def test_stamps_run_id_on_every_persisted_row(db):
     assert fixes and all(f.run_id == run.id for f in fixes)
 
 
-async def test_a_prose_only_spec_is_filled_across_the_population(db):
-    """End-to-end shape of the step: no metafields anywhere, so every family is targeted, and the
-    one that grounds+validates from the prose becomes a metafield fix — no injection involved."""
+async def test_a_prose_spec_is_filled_across_the_population(db):
+    """End-to-end shape of the step: no taxonomy attributes yet, so every applicable family is
+    targeted, and roast — grounded from the prose, on a categorized product — becomes a shopify
+    TAXONOMY metafield fix (never custom.*), with no injection involved."""
     shop = await _shop(db)
-    product = await _product(db, shop.id, 1)
+    product = await _product(
+        db, shop.id, 1,
+        category="Food, Beverages & Tobacco > Beverages > Coffee > Coffee Beans & Ground Coffee",
+    )
     client = ScriptedOptimizerClient(
         [AttributeCandidate(
             attribute="roast_level", value="light", source_field="body_html",
@@ -136,18 +140,19 @@ async def test_a_prose_only_spec_is_filled_across_the_population(db):
     reports = await propose_fixes_for_shop(db, shop.id, client)
 
     _, targets = client.calls[0]
-    assert len(targets) == 7  # nothing structured yet
+    assert len(targets) == 8  # nothing structured yet (decaffeination_method excluded, not decaf)
     assert reports[0].fillable >= 1
     fills = (
         await db.execute(
             select(Fix).where(
                 Fix.product_id == product.id,
-                Fix.target == "metafield:custom.roast_level",
+                Fix.target == "metafield:shopify.coffee-roast",
             )
         )
     ).scalars().all()
     assert len(fills) == 1
-    assert fills[0].after_json["value"] == "light"
+    assert fills[0].after_json["namespace"] == "shopify"
+    assert fills[0].after_json["value"] == "Light"
     assert fills[0].product_id == product.id
 
 

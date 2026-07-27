@@ -4,11 +4,18 @@ Produced by ``app.graph.audit`` from the rubric in ``services.audit_rubric``: th
 product's catalog data (missing description / GTIN / metafields, not discoverable, absent spec
 attributes), a ``severity`` band, and **two** coverage ratios.
 
-**Both coverage numbers are kept; neither replaces the other** (step 2b). ``structured_coverage``
-counts spec families carried by a metafield — the headline AI-legibility score, what engines
-actually read. ``spec_coverage`` counts families stated in the PROSE (title/body). The *difference*
-between them is the addressable set the Optimizer can fix automatically, which is why storing only
-one of them would lose the finding.
+**Two channel-specific coverage numbers; neither replaces the other, and they are NOT averaged**
+(step 2d — the 2c spike proved legibility is channel-specific). ``taxonomy_coverage`` is the
+headline machine-readable score: families written to their **taxonomy attribute** (the ``shopify``
+namespace channel Shopify feeds to agentic surfaces), over the **taxonomy-home families applicable
+to this product** (roast, origin, coffee_product_form; + decaffeination_method for decaf — so 3 or
+4). ``spec_coverage`` is PROSE coverage: families stated in title/body, over the **applicable spec
+families** (8 or 9). The *difference* is the addressable set.
+
+**Step 2d replaced ``structured_coverage`` with ``taxonomy_coverage``.** The 2b column counted
+``custom.*`` metafields, which the spike proved are NOT the AI-legible channel; its old meaning is
+now wrong, so it was DROPPED (not repurposed) rather than left to mislead a reader. ``custom.*`` is
+no longer a write target.
 
 **Run identity from day one.** ``run_id`` is a nullable FK to ``agent_runs`` (``ondelete=SET
 NULL``), the same pattern as ``engine_runs.run_id`` — an audit is measurement data we preserve
@@ -51,10 +58,12 @@ class Audit(Base):
     # with a grounded vocabulary (coffee today). Equipment / other / not-audited (draft) products
     # carry NULL — never a misleading 0.0.
     #
-    # PROSE coverage — families stated in title/body.
+    # PROSE coverage — families stated in title/body / applicable spec families (8 or 9).
     spec_coverage: Mapped[float | None] = mapped_column(Float, nullable=True)
-    # STRUCTURED coverage — families carried by a metafield. The headline AI-legibility score.
-    structured_coverage: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # TAXONOMY coverage — families written to their ``shopify`` taxonomy attribute / applicable
+    # taxonomy-home families (3 or 4). The headline AI-legibility score (the filter channel). NOT
+    # blended with prose. Replaced the 2b ``structured_coverage`` (which counted ``custom.*``).
+    taxonomy_coverage: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Bands: none | low | medium | high, plus ``not_audited`` for products excluded from the
     # population (not visible). Plain String, like the other status columns.
     severity: Mapped[str] = mapped_column(String(16), nullable=False)
