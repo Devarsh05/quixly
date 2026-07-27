@@ -42,14 +42,19 @@ from sqlalchemy.pool import NullPool
 
 from app.jobs.fix import propose_fixes_for_shop
 from app.models import AgentRunStatus, Audit, Fix, FixType, Product, QueryPanel, Shop
-from app.services.audit_rubric import SPEC_FAMILIES, SPEC_SCORED_CLASSES, structured_families
+from app.services.audit_rubric import (
+    SPEC_FAMILIES,
+    SPEC_SCORED_CLASSES,
+    applicable_families,
+    structured_families,
+)
 from app.services.matching import normalize_text
 from app.services.optimizer_llm import OpenAIOptimizerClient
 from app.services.runs import complete_agent_run, create_agent_run
 from app.settings import get_settings
 
-# PINNED HERE, NOT TAKEN FROM ENV — the extraction surface is 7 families x every coffee product, so
-# a report is only interpretable next to the model that produced it. Printed in every header.
+# PINNED HERE, NOT TAKEN FROM ENV — the extraction surface is up to 9 families x every coffee
+# product, so a report is only interpretable next to the model that produced it. Printed in headers.
 MODEL = "gpt-5-nano"
 REASONING_EFFORT = "minimal"
 
@@ -71,15 +76,21 @@ async def _load_products(session, shop_id: int) -> list[Product]:
 
 
 def _three_state(product: Product) -> tuple[set[str], set[str], set[str]]:
-    """The rubric's deterministic split for one product: (structured, unstructured, absent)."""
-    structured = structured_families(product.metafields_json)
-    prose = normalize_text(f"{product.title or ''} {product.body or ''}")
+    """The rubric's deterministic split for one product: (structured, unstructured, absent).
+
+    Over the APPLICABLE families only (step 2d): decaffeination_method is dropped for a non-decaf
+    coffee, and ``structured`` counts the taxonomy-attribute channel (``shopify`` namespace).
+    """
+    prose_text = f"{product.title or ''} {product.body or ''}"
+    prose = normalize_text(prose_text)
+    applicable = set(applicable_families(prose_text))
+    structured = structured_families(product.metafields_json) & applicable
     in_prose = {
         family
-        for family, spec in SPEC_FAMILIES.items()
-        if any(normalize_text(p) in prose for p in spec.detect)
+        for family in applicable
+        if any(normalize_text(p) in prose for p in SPEC_FAMILIES[family].detect)
     }
-    return structured, in_prose - structured, set(SPEC_FAMILIES) - in_prose - structured
+    return structured, in_prose - structured, applicable - in_prose - structured
 
 
 def report_deterministic(products: list[Product], audits: dict[int, Audit]) -> None:
@@ -93,7 +104,7 @@ def report_deterministic(products: list[Product], audits: dict[int, Audit]) -> N
     print(f"  {'TOTAL':<12} {sum(hist.values()):>3}")
 
     print("\nThree-state coverage per product (spec-scored classes only):")
-    print(f"  {'id':>4}  {'class':<9} {'prose':>6} {'struct':>7}  {'sev':<11} "
+    print(f"  {'id':>4}  {'class':<9} {'prose':>6} {'taxon':>7}  {'sev':<11} "
           "unstructured (fillable)")
     totals = collections.Counter()
     for product in products:
@@ -108,8 +119,9 @@ def report_deterministic(products: list[Product], audits: dict[int, Audit]) -> N
         totals["structured"] += len(structured)
         totals["unstructured"] += len(unstructured)
         totals["absent"] += len(absent)
+        taxonomy = audit.taxonomy_coverage if audit.taxonomy_coverage is not None else 0.0
         print(f"  {product.id:>4}  {audit.product_class:<9} "
-              f"{audit.spec_coverage:>6.2f} {audit.structured_coverage:>7.2f}  "
+              f"{audit.spec_coverage:>6.2f} {taxonomy:>7.2f}  "
               f"{audit.severity:<11} {sorted(unstructured)}")
 
     total_pairs = sum(totals.values())
@@ -138,8 +150,10 @@ def report_llm(reports: list, fixes: list[Fix]) -> None:
     for reason, count in sorted(drops.items()):
         print(f"  {reason:<16} {count:>3}")
 
-    fills = [f for f in fixes if f.type in (FixType.metafield, FixType.description)]
-    print(f"\nFILLS ({len(fills)}) — each with its source citation:")
+    fills = [
+        f for f in fixes if f.type in (FixType.metafield, FixType.description, FixType.category)
+    ]
+    print(f"\nFILLS / PROPOSALS ({len(fills)}) — each with its source citation:")
     for fix in fills:
         print(f"\n  product={fix.product_id}  type={fix.type}  target={fix.target}")
         print(f"    diff   : {fix.diff}")

@@ -21,20 +21,33 @@ merchant data by ``services.catalog.classify_product`` — never inferred by a m
 * **Metafields** are a store-level finding (computed by the caller across the population), not a
   per-product gap — so an empty catalog no longer inflates every product's severity.
 
-**Three-state spec model (step 2b).** Every (product, spec family) is one of:
+**Three-state spec model — UNCHANGED since step 2b.** Every (product, spec family) is one of:
 
-* ``structured``   — carried by a metafield keyed to the family. Machine-readable; nothing to do.
-* ``unstructured`` — stated in the PROSE (title/body) but not in a metafield. Optimizer-fixable.
+* ``structured``   — carried by its **taxonomy attribute** metafield (the ``shopify`` namespace).
+  Machine-readable; nothing to do.
+* ``unstructured`` — stated in the PROSE (title/body) but not structured. Optimizer-fixable.
 * ``absent``       — nowhere. A merchant to-do.
 
-So there are **two coverage numbers, and neither replaces the other**: ``structured_coverage`` is
-the headline AI-legibility score (what engines actually read), ``spec_coverage`` is PROSE coverage,
-and the **difference between them is the addressable set** ("prose 0.86 / structured 0.00" is a
-sharper finding than either alone).
+Step 2d did **not** move this classification. What changed is only **which write makes a family
+``structured``** — the ``shopify`` taxonomy attribute, **not** ``custom.*`` (the 2c spike proved
+``custom.*`` is not the AI-legible channel), and only the 4 **taxonomy-home** families
+(``services.taxonomy_map.TAXONOMY_HOME_FAMILIES``) can ever reach ``structured``; the other 5 top
+out at ``unstructured`` (their legible home is the description prose).
 
-Prose presence is a normalised substring match (``services.matching.normalize_text``) over title +
-description only — **metafield values are the structured channel and are deliberately excluded**
-from the prose text, or a structured family would also inflate prose coverage.
+**Two channel-specific coverage numbers, NOT blended** (blending would re-bury the spike's central
+finding that legibility is channel-specific):
+
+* ``taxonomy_coverage`` — families written to their taxonomy attribute / **applicable taxonomy-home
+  families** (3, or 4 for a decaf product). The headline score (the filter channel Shopify feeds
+  agentic surfaces).
+* ``spec_coverage`` — families stated in the PROSE / **applicable spec families** (8, or 9 for a
+  decaf product). ``decaffeination_method`` is applicable only to decaf products (like GTIN for
+  equipment), so both denominators are per-product.
+
+The **difference is the addressable set** ("prose 0.86 / taxonomy 0.00" is a sharper finding than
+either alone). Prose presence is a normalised substring match (``services.matching.normalize_text``)
+over title + description only — **metafield values are the structured channel and are deliberately
+excluded** from the prose text, or a structured family would also inflate prose coverage.
 
 **The audit's unstructured/absent split is a deterministic DETECT-BASED PROXY.** The rubric stays
 LLM-free, so it cannot ask an extractor what is really in the prose; it asks ``detect``. The
@@ -52,6 +65,7 @@ from pydantic import BaseModel
 
 from app.services.catalog import extract_gtin
 from app.services.matching import normalize_text
+from app.services.taxonomy_map import TAXONOMY_ATTRIBUTES, TAXONOMY_HOME_FAMILIES
 
 # Product bodies are HTML; strip tags before any text test so ``<p><br></p>`` doesn't read as text.
 _HTML_TAG = re.compile(r"<[^>]+>")
@@ -194,7 +208,57 @@ SPEC_FAMILIES: dict[str, SpecFamily] = {
         labels=("brew method", "brewing", "brew"),
         metafield_aliases=("brew method", "brewing method", "brew", "recommended brew method"),
     ),
+    # --- step 2d: the two "free native wins" the 2c spike found (taxonomy-home) ------------------
+    "coffee_product_form": SpecFamily(
+        detect=("whole bean", "whole beans", "whole-bean", "ground coffee", "pre-ground"),
+        kind="closed",
+        # Bare "ground" is a valid VALUE (whole-word matched by validate_spec_value) but too generic
+        # to DETECT on (it would false-match "background"), so it is out of ``detect``.
+        values=("whole bean", "whole beans", "whole-bean", "ground"),
+        labels=("product form", "form"),
+        metafield_aliases=("coffee product form", "product form", "form"),
+    ),
+    "decaffeination_method": SpecFamily(
+        # CONDITIONAL family (see ``CONDITIONAL_FAMILIES``): applicable only to decaf products, so a
+        # regular coffee is never dinged for lacking a decaffeination method.
+        detect=(
+            "swiss water", "mountain water", "carbon dioxide", "co2 process", "methylene chloride",
+            "ethyl acetate", "decaffeination", "sugarcane process",
+        ),
+        kind="closed",
+        values=(
+            "swiss water", "mountain water", "carbon dioxide", "methylene chloride",
+            "ethyl acetate", "co2",
+        ),
+        labels=("decaffeination method", "decaf method", "decaffeination"),
+        metafield_aliases=("decaffeination method", "decaf method"),
+    ),
 }
+
+# A family that applies only to a subset of products (mirrors GTIN → equipment). Value = a predicate
+# over the product's prose text. ``decaffeination_method`` applies only to decaf products, so both
+# coverage denominators and the gap list drop it for a regular coffee — it is not an "absent" gap.
+def _is_decaf(prose: str) -> bool:
+    return "decaf" in prose
+
+
+CONDITIONAL_FAMILIES: dict[str, "object"] = {"decaffeination_method": _is_decaf}
+
+
+def applicable_families(prose: str) -> list[str]:
+    """Spec families that apply to this product, in ``SPEC_FAMILIES`` order (deterministic).
+
+    ONE definition, both consumers (CLAUDE.md "one normalizer"): the rubric uses it for coverage
+    denominators + gap emission, and the Optimizer uses it to gate targeting so a non-decaf coffee
+    is never asked for (or given a to-do about) a decaffeination method. ``prose`` is the text each
+    caller already has — title+body for the rubric, the combined source text for the Optimizer.
+    """
+    normalized = normalize_text(prose)
+    return [
+        family
+        for family in SPEC_FAMILIES
+        if family not in CONDITIONAL_FAMILIES or CONDITIONAL_FAMILIES[family](normalized)
+    ]
 
 # Derived view for the rubric — the detection phrases, exactly as before. Do NOT hand-edit; it is
 # the single SPEC_FAMILIES definition projected.
@@ -209,31 +273,35 @@ def _normalize_key(text: str) -> str:
     return normalize_text(text.replace("_", " "))
 
 
-# Metafield key -> family, built once from the single SPEC_FAMILIES definition. Namespace-agnostic:
-# merchants pick their own namespace, and the family is named by the KEY (the Optimizer writes
-# ``custom.<family>``, see graph.optimizer).
+# Taxonomy attribute handle -> family (step 2d). ``structured`` now means "carried by the TAXONOMY
+# attribute" — the ``shopify`` reserved namespace, the channel Shopify feeds to agentic surfaces —
+# NOT ``custom.*`` (the 2c spike proved custom.* is not legible). Built from the single
+# ``taxonomy_map`` definition, so only the 4 taxonomy-home families can ever be structured.
+_TAXONOMY_STRUCTURED_KEY = "shopify"
 _STRUCTURED_KEYS: dict[str, str] = {
-    _normalize_key(alias): family
-    for family, spec in SPEC_FAMILIES.items()
-    for alias in (family, *spec.metafield_aliases)
+    _normalize_key(attribute.handle): family
+    for family, attribute in TAXONOMY_ATTRIBUTES.items()
 }
 
 
 def structured_families(metafields: list[dict] | None) -> set[str]:
-    """Spec families already carried by a structured metafield — the ``structured`` state.
+    """Spec families already carried by their **taxonomy attribute** — the ``structured`` state.
 
     **One definition, both consumers** (CLAUDE.md "one normalizer"): the rubric reads it for
-    ``structured_coverage``, and the Optimizer subtracts it from the spec families to get its
-    targets. Because targeting is derived from THIS and never from ``detect``/``audit.gaps``,
-    refining detection can never add or remove a fill opportunity.
+    ``taxonomy_coverage``, and the Optimizer subtracts it from the spec families to get its targets.
+    Because targeting is derived from THIS and never from ``detect``/``audit.gaps``, refining
+    detection can never add or remove a fill opportunity.
 
-    A key with an empty/absent value does **not** count as structured — an empty metafield is not
-    machine-readable, and treating it as structured would both inflate the headline score and drop
-    a real gap from the Optimizer's targets.
+    Step 2d: a family is structured only when a metafield in the reserved ``shopify`` namespace is
+    keyed to its taxonomy attribute handle (e.g. ``shopify.coffee-roast``). A ``custom.*`` metafield
+    — including the ones the pre-2d Optimizer wrote — does **not** count: it is not the legible
+    channel. A key with an empty/absent value does not count either.
     """
     found: set[str] = set()
     for field in metafields or []:
         if not isinstance(field, dict):
+            continue
+        if normalize_text(str(field.get("namespace") or "")) != _TAXONOMY_STRUCTURED_KEY:
             continue
         value = field.get("value")
         if not (isinstance(value, str) and value.strip()):
@@ -324,11 +392,12 @@ class AuditResult(BaseModel):
     audited: bool
     product_class: str
     gaps: list[AuditGap]
-    # PROSE coverage: families stated in title/body. Informational; the addressable set is the
-    # difference between this and structured_coverage.
+    # PROSE coverage: families stated in title/body / applicable spec families. Informational; the
+    # addressable set is the difference between this and taxonomy_coverage.
     spec_coverage: float | None  # None when the class is not spec-scored or the product is excluded
-    # Headline AI-legibility: families carried by a structured metafield — what engines read.
-    structured_coverage: float | None
+    # Headline AI-legibility: families written to their taxonomy attribute / applicable
+    # taxonomy-home families — the channel Shopify feeds to agentic surfaces. NOT blended.
+    taxonomy_coverage: float | None
     severity: str  # none | low | medium | high | not_audited
     excluded_reason: str | None = None
 
@@ -384,7 +453,7 @@ def evaluate_product(
             product_class=product_class,
             gaps=[],
             spec_coverage=None,
-            structured_coverage=None,
+            taxonomy_coverage=None,
             severity=SEVERITY_NOT_AUDITED,
             excluded_reason="not_visible",
         )
@@ -400,23 +469,28 @@ def evaluate_product(
         )
 
     spec_coverage: float | None = None
-    structured_coverage: float | None = None
+    taxonomy_coverage: float | None = None
     if product_class in SPEC_SCORED_CLASSES:
         prose = _prose_text(title, body)
-        structured = structured_families(metafields)
+        # Applicable families only: decaffeination_method is dropped for a non-decaf coffee, so it
+        # never counts as an "absent" gap or dilutes a denominator (mirrors GTIN → equipment).
+        applicable = applicable_families(prose)
+        applicable_set = set(applicable)
+        structured = structured_families(metafields) & applicable_set
         in_prose = {
             family
-            for family, phrases in SPEC_VOCABULARY.items()
-            if any(normalize_text(phrase) in prose for phrase in phrases)
+            for family in applicable
+            if any(normalize_text(phrase) in prose for phrase in SPEC_VOCABULARY[family])
         }
-        total = len(SPEC_VOCABULARY)
-        spec_coverage = len(in_prose) / total
-        structured_coverage = len(structured) / total
+        spec_coverage = len(in_prose) / len(applicable)
+        # Taxonomy coverage: the headline channel, over applicable taxonomy-home families only.
+        home = [f for f in applicable if f in TAXONOMY_HOME_FAMILIES]
+        taxonomy_coverage = len(structured & set(home)) / len(home) if home else None
 
         # Three-state (detect-based proxy): a structured family is machine-readable and emits no
         # gap; everything else is a gap tagged with WHY it is one, which drives both the weight and
         # the merchant-facing detail.
-        for family in SPEC_VOCABULARY:
+        for family in applicable:
             if family in structured:
                 continue
             label = family.replace("_", " ")
@@ -448,7 +522,7 @@ def evaluate_product(
         product_class=product_class,
         gaps=gaps,
         spec_coverage=spec_coverage,
-        structured_coverage=structured_coverage,
+        taxonomy_coverage=taxonomy_coverage,
         severity=_severity(score),
     )
 
