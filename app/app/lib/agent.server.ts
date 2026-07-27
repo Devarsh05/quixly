@@ -45,6 +45,56 @@ export type ScanReport = {
 
 export type ScanStart = { run_id: number; status: string };
 
+/** Where a proposed value literally came from — rendered as the merchant's trust signal. */
+export type Citation = {
+  attribute: string | null;
+  source_field: string | null;
+  snippet: string | null;
+};
+
+export type AddedLine = { label: string; value: string };
+
+/**
+ * One fix, PRE-RENDERED by the agent. The shell derives nothing from this — `approvable`,
+ * `added_lines` and `block_reason` are all decided agent-side so the business rules live in one
+ * place (CLAUDE.md: keep the shell thin).
+ */
+export type FixView = {
+  id: number;
+  type: "description" | "category" | "metafield" | "merchant_todo";
+  target: string;
+  status: string;
+  reason: string | null;
+  diff: string | null;
+  citations: Citation[];
+  approvable: boolean;
+  block_reason: string | null;
+  added_lines: AddedLine[];
+  category_from: string | null;
+  category_to: string | null;
+  metafield_value: string | null;
+  metafield_key: string | null;
+};
+
+export type ProductFixes = {
+  product_id: number;
+  title: string | null;
+  severity: string | null;
+  approvable: FixView[];
+  not_publishable: FixView[];
+  needs_input: FixView[];
+};
+
+export type FixList = {
+  run_id: number | null;
+  status: "running" | "completed" | "failed" | null;
+  products: ProductFixes[];
+};
+
+export type FixRunStart = { run_id: number; status: string };
+
+export type FixDecision = { fix_id: number; status: string };
+
 function agentUrl(path: string): string {
   const base = process.env.AGENT_SERVICE_URL;
   if (!base) throw new Error("AGENT_SERVICE_URL is not set");
@@ -135,4 +185,56 @@ export async function getReport(
     throw new Error(`Agent report returned ${response.status}`);
   }
   return (await response.json()) as ScanReport;
+}
+
+/**
+ * Start an audit + optimize run. Async agent-side (202 + run_id), polled like a scan.
+ *
+ * NOT a publish: this only proposes fixes into `fixes.status = proposed`. Nothing reaches the
+ * merchant's store until it is approved AND the step-4 Publisher runs.
+ */
+export function startFixRun(shopDomain: string): Promise<FixRunStart> {
+  return post<FixRunStart>(
+    `/shops/by-domain/${encodeURIComponent(shopDomain)}/fixes/run`,
+    {},
+  );
+}
+
+/**
+ * Proposed fixes for a run, grouped by product and already split into approvable /
+ * not-publishable / needs-input by the agent.
+ *
+ * A shop that has never proposed fixes returns `run_id: null` with an empty list — that is a
+ * normal empty state, NOT an error, and is distinct from the agent being unreachable.
+ */
+export async function getFixes(shopDomain: string, runId?: number): Promise<FixList> {
+  const query = runId != null ? `?run_id=${runId}` : "";
+  const response = await fetch(
+    agentUrl(`/shops/by-domain/${encodeURIComponent(shopDomain)}/fixes${query}`),
+    { headers: internalHeaders() },
+  );
+
+  if (!response.ok) {
+    throw new Error(`Agent fixes returned ${response.status}`);
+  }
+  return (await response.json()) as FixList;
+}
+
+/**
+ * THE APPROVAL GATE. Flips `fixes.status` proposed -> approved | rejected and nothing else.
+ *
+ * No Shopify write happens here or anywhere in this step. `shopDomain` always comes from the
+ * authenticated session, never from the request body — it is what scopes the fix to its owner.
+ * The agent re-checks ownership and refuses a non-approvable type with 409, so a crafted request
+ * cannot approve a taxonomy fix the UI declines to offer.
+ */
+export function decideFix(
+  shopDomain: string,
+  fixId: number,
+  decision: "approve" | "reject",
+): Promise<FixDecision> {
+  return post<FixDecision>(
+    `/shops/by-domain/${encodeURIComponent(shopDomain)}/fixes/${fixId}/${decision}`,
+    {},
+  );
 }
