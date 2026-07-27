@@ -34,6 +34,22 @@ the phase by which it should be revisited.
   verbatim later (e.g. an answer-snippet evidence join) requires BOTH persisting it AND narrowing it
   to the brand's local sentence/window. _Raised: 2026-07-17; corrected: 2026-07-22._
 
+## Optimizer
+
+- **FALSE "ABSENT" TO-DO — blocker, fix before Step 4.** The Optimizer emits a merchant to-do
+  claiming a spec is absent when extraction flakily misses a spec the deterministic audit
+  classified `unstructured`. Run 839: `spec:origin` "No origin stated in any source field" on
+  product 113, title *"Ethiopia Yirgacheffe 340 g"* — the to-do contradicts both the audit's own
+  `unstructured` classification and the literal title. **Root cause:** positive claims (fills) are
+  grounded by literal-presence; negative claims (absence to-dos) are not. **Fix:** no "absent" to-do
+  may contradict the audit — mirror the positive guard with a negative literal-presence check keyed
+  on `SPEC_VOCABULARY`; when the audit says `unstructured`, route an ungrounded target to the
+  description path (keeping the gap→row accounting invariant satisfied), never to an absence to-do.
+  A false to-do survives the approval gate (it looks like advice), so it must not reach a merchant.
+  Also logged: `gpt-5-nano`/`minimal` is flaky on title-resident extraction — the reliability bar
+  rose once misses became merchant-facing to-dos. _Raised: 2026-07-27 (Phase 3 step 2d acceptance,
+  run 839)._
+
 ## Token custody / refresh locking
 
 - **Webhook refresh path is pool-coupled and can deadlock under concurrent same-shop webhook

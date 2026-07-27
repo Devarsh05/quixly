@@ -130,6 +130,9 @@ they **break the chain and force the merchant to reinstall**.
   Publishing flows through `fixes.status = approved` only.
 - **Never fabricate product attributes, specs, GTINs, or reviews.** Optimizer may only
   enrich/restructure from verified source data; every fix carries a before/after diff + source.
+- **Category assignment is a publish-class write.** Assigning a Standard-taxonomy category (the
+  `category` fix type) has tax/channel consequences and is approval-gated like a store publish —
+  never bundled as a low-risk metafield. It is the precondition for every taxonomy attribute write.
 - **Schema ownership.** `shopify` schema = Prisma (`Session` + `_prisma_migrations`).
   `public` = Alembic (everything else). **Neither tool may touch the other's.** Do NOT set
   `version_table_schema` in Alembic's `env.py` — it disables Alembic's self-exclusion and
@@ -167,6 +170,37 @@ they **break the chain and force the merchant to reinstall**.
 ## Conventions
 - Monorepo; keep `app/` and `agent/` independently runnable.
 - Agent graph nodes live in `agent/app/graph/` — one file per node.
+- **Optimizer write channels (step 2d) — `custom.*` is RETIRED as a write target.** The
+  AI-legibility channels are exactly two: **taxonomy attributes** (`shopify` namespace,
+  `list.metaobject_reference`) for the four **taxonomy-home** families — `coffee-roast`, `country`
+  (origin), `coffee-product-form`, `decaffeination-method` — and the product **description** (the
+  HTML-preserving append-list composer `_compose_description`) for every other grounded family.
+  Never reintroduce a `custom.*` write unless the L5 Catalog-ingestion question (does Catalog read
+  non-mapped `custom.*`?) resolves **positive** — see `docs/decisions/2c-write-target.md`.
+- **Gap→row accounting (Optimizer).** Every family in the Optimizer's `spec_targets` resolves to
+  **exactly one** of {taxonomy metafield fill, description line, merchant to-do}, pairwise disjoint
+  — asserted in `run_optimizer` before persist. A target producing **zero** rows is always a
+  routing bug. Stated over `spec_targets` (extraction-based), **not** `audit.gaps_json` (the
+  deterministic detect proxy, which is allowed to diverge from extraction).
+- **The Optimizer is Shopify-free.** It makes no live Shopify calls. A taxonomy fix carries the
+  canonical `TaxonomyValue` GID at propose-time; the **value → per-shop-metaobject-entry-GID**
+  resolution is **publish-time** (the Publisher, Step 4), because the metaobject surface needs
+  `read_metaobjects`.
+- **Taxonomy write mechanics.** A taxonomy attribute write needs a **per-shop metaobject-entry
+  GID**, NOT the canonical `TaxonomyValue` GID (Shopify rejects the latter with `INVALID_VALUE`).
+  The standard-taxonomy metaobject surface is **invisible without `read_metaobjects`**. Evidence:
+  `docs/decisions/2c-write-target.md` (L1/L2).
+- **Audit coverage = two channel-specific numbers, never blended.** `audits.taxonomy_coverage`
+  (headline machine-readable score, over applicable **taxonomy-home** families — 3, or 4 for a
+  decaf product) and `audits.spec_coverage` (prose channel, over applicable spec families — 8, or 9
+  for decaf). The old `structured_coverage` (which counted `custom.*`) is **DROPPED** (migration
+  `c1f2a3b4d5e6`). Three-state classification (structured/unstructured/absent) is unchanged — only
+  *which write makes a family `structured`* moved (taxonomy attribute, not `custom.*`).
+- **Settled Shopify scope set for the taxonomy path.** `write_products + read_metaobjects +
+  read_publications`, granted in **one** re-consent, declared in `app/shopify.app.toml` as part of
+  **Step 4** (not earlier — publish-time GID resolution means the extra scope isn't needed until
+  then). `read_metaobjects` = resolve taxonomy values to metaobject GIDs; `read_publications` =
+  confirm the Catalog/Agentic channel exists and resolve `shops.plan`.
 - **`products.visibility_state` has ONE normalizer** — `normalize_visibility_state` in
   `agent/app/services/catalog.py`, used by BOTH writers (the ingest job and the `products/update`
   webhook). Case-insensitive (GraphQL yields UPPERCASE, webhooks lowercase); maps
@@ -219,11 +253,18 @@ Only items confirmed by committed code or a session log are checked.
 - [x] Read-only report UI: embedded audit page + agent client `startScan` / `getReport`
 - [x] Gate F — live webhook verification: `products/update` (HMAC + DB write) & `app/uninstalled` (status flip); topic-dispatch fix `f0b97bc`; reinstall + re-ingest 20/20
 
-### Phase 3 — Fix — not started
-- [ ] Product audit (per-product gaps vs. grounded source data)
-- [ ] Grounded Optimizer (description + JSON-LD + metafields/GTIN), before/after diff + source per fix
-- [ ] Preview/approve UI behind the mandatory approval gate (`fixes.status = approved`)
-- [ ] Publisher (Admin API writes) — dev store only first, re-read + parse-check after publish
+### Phase 3 — Fix — Optimizer complete; approval UI + Publisher remain
+- [x] Product audit — per-product, per-class rubric; three-state spec model
+      (structured/unstructured/absent); two channel-specific coverage numbers. Gate G, re-baked as
+      Gate M when the family set grew 7→9 (added `coffee-product-form`, `decaffeination-method`)
+- [x] Write-target spike — proved the AI-legibility channel is taxonomy + description, not
+      `custom.*`; settled the GID form and the two scope walls (`docs/decisions/2c-write-target.md`)
+- [x] Grounded Optimizer — structural targeting; taxonomy-attribute / description / `category`
+      routing (`custom.*` retired); grounding guard + gap→row accounting invariant; demo seed
+      retired (Gates H/L/M). Before/after diff + source per fix
+- [ ] Preview/approve UI behind the mandatory approval gate (`fixes.status = approved`) — Step 3
+- [ ] Publisher (Admin API writes) — dev store only first, re-read + parse-check after publish;
+      resolves the per-shop metaobject GID and requests the settled scope set — Step 4
 
 ### Phase 4 — Verify — not started
 - [ ] Verifier loop
@@ -237,9 +278,10 @@ Only items confirmed by committed code or a session log are checked.
 - [ ] App Store submission (incl. compliance webhooks `customers/data_request`/`redact`, `shop/redact`)
 - [ ] MCP server
 
-**Next action:** Phase 3 begins with a **plan-first** design of the grounded Optimizer + Publisher
-(Admin API writes) behind the mandatory approval gate — Phase 3 is the first phase that writes to
-live merchant stores, so no code before an approved plan.
+**Next action:** the Optimizer half of Phase 3 is complete. Before Step 4, close the false "absent"
+to-do blocker (`docs/backlog.md` → Optimizer). Then Step 3 (approval UI) and Step 4 (Publisher +
+Admin API writes behind the approval gate, requesting the settled scope set) — both **plan-first**,
+as the first code that writes to live merchant stores.
 
 ## Session Log
 
