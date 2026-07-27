@@ -26,6 +26,22 @@ a structural set, NOT the audit's gap list. Each grounded value is then ROUTED (
 * **merchant_todo** — every applicable gap that could NOT be grounded (absent/ambiguous), and
   always ``missing_gtin`` (a barcode cannot be derived — PRD §13). ``after_json = NULL``.
 
+**NEGATIVE claims are grounded too (step 2e).** A to-do is a merchant-facing assertion about the
+product, and a false one survives the approval gate because it reads as advice rather than a diff.
+So absence is guarded exactly the way presence is. Extraction returning nothing is **not** evidence
+of absence — it is routinely a flaky-LLM miss — so before a family is written off:
+
+1. **Deterministic recovery** (``audit_rubric.recover_spec_value``) reads the value straight out of
+   the source text with no LLM, keyed on the same ``SPEC_FAMILIES`` vocabulary the audit detects
+   with. It PROPOSES a candidate for the unchanged guards; it never bypasses them.
+2. **The negative literal-presence guard** then permits the ``absent`` claim only when no
+   vocabulary token for the family is in ANY source field **and** the deterministic audit did not
+   classify it ``unstructured``. Otherwise the to-do is downgraded to the truthful
+   ``mentioned_no_value`` tier, which cites what was found.
+
+Both outcomes still terminate in {taxonomy fill, description line, to-do}, so the gap→row
+accounting invariant below is unchanged — recovery only moves a family between existing routes.
+
 Convergence: once a taxonomy metafield is published a family becomes ``structured`` and drops from
 targets. A taxonomy-less family has no structured channel, so its labeled description line is the
 terminal legibility action — proposals stay deterministic run-to-run (idempotent over the same
@@ -47,8 +63,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Audit, Fix, FixStatus, FixType, Product
 from app.services.audit_rubric import (
     SEVERITY_NOT_AUDITED,
+    SPEC_MISSING,
     SPEC_SCORED_CLASSES,
+    STATE_UNSTRUCTURED,
     applicable_families,
+    detect_hit_in_fields,
+    recover_spec_value,
     structured_families,
     validate_spec_value,
 )
@@ -77,6 +97,20 @@ class DroppedCandidate(BaseModel):
     reason: str
 
 
+class RecoveredCandidate(BaseModel):
+    """A family the DETERMINISTIC recovery rescued after the LLM extractor failed to ground it.
+
+    ``missed_as`` is the drop reason the to-do would have carried had recovery not fired —
+    ``absent`` means a **false absence claim was prevented** (the step-2e bug), so this list is
+    both the flakiness telemetry and the count that must go to zero for false to-dos.
+    """
+
+    attribute: str
+    value: str
+    source_field: str
+    missed_as: str
+
+
 class OptimizerReport(BaseModel):
     """The Optimizer node's typed return."""
 
@@ -85,6 +119,7 @@ class OptimizerReport(BaseModel):
     fillable: int
     todos: int
     dropped: list[DroppedCandidate]
+    recovered: list[RecoveredCandidate] = []
 
 
 def ground_attribute(candidate: AttributeCandidate, source_fields: dict[str, str]) -> str | None:
@@ -224,10 +259,27 @@ def _compose_description(body_html: str | None, grounded: dict[str, AttributeCan
     return f"{body_html or ''}{block}"
 
 
+# Drop reason for "the family IS mentioned in source, but no specific value could be read" — the
+# third to-do tier added in step 2e. It exists so the ABSENCE claim never has to be stretched to
+# cover a family that is demonstrably present (e.g. a body saying "single-origin" with no country).
+DROP_MENTIONED_NO_VALUE = "mentioned_no_value"
+DROP_ABSENT = "absent"
+
+
 def _todo_reason(
-    attribute: str, drop_reason: str, value: str | None, source_field: str | None
+    attribute: str,
+    drop_reason: str,
+    value: str | None,
+    source_field: str | None,
+    mention: tuple[str, str] | None = None,
 ) -> str:
-    """Merchant-facing reason for an unfilled spec gap — truthful about WHY it is unfilled."""
+    """Merchant-facing reason for an unfilled spec gap — truthful about WHY it is unfilled.
+
+    Every branch is a claim the node can defend from evidence it holds. In particular the
+    ``absent`` branch is reachable ONLY behind the negative grounding guard in ``run_optimizer``
+    (step 2e): the family must be literally absent from every source field AND not classified
+    ``unstructured`` by the deterministic audit.
+    """
     family = attribute.replace("_", " ")
     if drop_reason == "mis_assignment":
         return (
@@ -237,7 +289,47 @@ def _todo_reason(
     if drop_reason == "fabrication":
         # Merchant-facing: never expose what the model proposed.
         return f"No verified {family} was found in your product data; a merchant must add it."
+    if drop_reason == DROP_MENTIONED_NO_VALUE:
+        if mention is not None:
+            field, phrase = mention
+            return (
+                f"{family} is referred to in {field} ({phrase!r}) but no specific {family} value "
+                f"could be read; a merchant must state it explicitly."
+            )
+        # No live mention: the audit classified the family as stated in the description. Its own
+        # gap detail is the evidence; we still refuse to claim absence.
+        return (
+            f"The audit found {family} stated in this product's description, but no specific "
+            f"value could be read; a merchant must state it explicitly."
+        )
     return f"No {family} stated in any source field; a merchant must add it."
+
+
+def _todo_evidence(
+    attribute: str,
+    drop_reason: str,
+    rejected_value: str | None,
+    rejected_field: str | None,
+    mention: tuple[str, str] | None,
+    audit_state: str | None,
+) -> list[dict] | None:
+    """``source_json`` for a spec to-do — SQL NULL **only** for a true absence claim.
+
+    A genuinely absent family has no evidence to cite, so it keeps the established NULL. Every
+    other tier carries the evidence behind its claim, queryable by ``drop_reason``.
+    """
+    if drop_reason == DROP_ABSENT:
+        return None
+    if drop_reason == DROP_MENTIONED_NO_VALUE:
+        field, phrase = mention if mention is not None else (None, None)
+        return [{
+            "attribute": attribute, "source_field": field, "detected_phrase": phrase,
+            "audit_state": audit_state, "drop_reason": drop_reason,
+        }]
+    return [{
+        "attribute": attribute, "source_field": rejected_field,
+        "rejected_value": rejected_value, "drop_reason": drop_reason,
+    }]
 
 
 async def run_optimizer(
@@ -303,6 +395,19 @@ async def run_optimizer(
     has_description_gap = any(g.get("code") == "missing_description" for g in gaps)
     has_gtin_gap = any(g.get("code") == "missing_gtin" for g in gaps)
 
+    # THE AUTHORITY FOR ABSENCE (step 2e). The audit's three-state classification is deterministic
+    # and literal; extraction is an LLM and is flaky. So for the ABSENCE question the audit wins:
+    # a family the audit called ``unstructured`` (stated in the prose) may never be reported absent,
+    # no matter what extraction did this run. This does NOT re-couple targeting to the audit — the
+    # detect-proxy and the extraction split are still free to diverge (see ``audit_rubric``); the
+    # audit gates only which merchant-facing CLAIM is permissible, never which families are
+    # targeted.
+    audit_states: dict[str, str] = {
+        gap["attribute"]: gap.get("state") or ""
+        for gap in gaps
+        if gap.get("code") == SPEC_MISSING and gap.get("attribute")
+    }
+
     extracted = await client.extract(source_fields, spec_targets) if spec_targets else None
     candidates = extracted.attributes if extracted else []
 
@@ -340,6 +445,40 @@ async def run_optimizer(
             )
         else:
             grounded[candidate.attribute] = candidate
+
+    # DETERMINISTIC RECOVERY (step 2e). Extraction returning nothing is NOT evidence of absence —
+    # it is routinely a flaky-LLM miss (run 839 missed ``origin`` on a product titled "Ethiopia
+    # Yirgacheffe"). Before any family is written off, try to read its value straight out of the
+    # source text with the LLM-free scanner, which is keyed on the SAME ``SPEC_FAMILIES`` vocabulary
+    # the audit detects with. Runs for EVERY ungrounded target regardless of why extraction failed
+    # (null return, fabrication, mis-assignment) — all three are extraction failures, and a to-do is
+    # equally wrong in all three when the value is sitting in the title.
+    #
+    # Recovery PROPOSES, it does not bypass: every recovered value goes through the exact same
+    # ``ground_attribute`` + ``validate_spec_value`` guards as an LLM candidate, so there is no
+    # second, weaker path into a fix. A recovered family then routes through the unchanged
+    # taxonomy/description logic below, which is why the gap→row accounting invariant is untouched.
+    recovered: list[RecoveredCandidate] = []
+    for attribute in spec_targets:
+        if attribute in grounded:
+            continue
+        recovery = recover_spec_value(attribute, source_fields)
+        if recovery is None:
+            continue
+        candidate = AttributeCandidate(
+            attribute=attribute, value=recovery.value,
+            source_field=recovery.source_field, snippet=recovery.snippet, ambiguous=False,
+        )
+        value = ground_attribute(candidate, source_fields)
+        if value is None or not validate_spec_value(attribute, value, candidate.snippet or ""):
+            continue
+        grounded[attribute] = candidate
+        recovered.append(
+            RecoveredCandidate(
+                attribute=attribute, value=value, source_field=recovery.source_field,
+                missed_as=unfillable.get(attribute, (DROP_ABSENT, None, None))[0],
+            )
+        )
 
     fixes: list[Fix] = []
     product_categorized = has_taxonomy_category(product.category)
@@ -390,22 +529,36 @@ async def run_optimizer(
         else:
             todo_families.add(attribute)
             drop_reason, rejected_value, rejected_field = unfillable.get(
-                attribute, ("absent", None, None)
+                attribute, (DROP_ABSENT, None, None)
             )
+            # THE NEGATIVE LITERAL-PRESENCE GUARD (step 2e) — the mirror of ``ground_attribute``.
+            # A fill must be literally present to be claimed; an ABSENCE must be literally absent.
+            # Two independent conditions, either of which forbids the absence claim:
+            #   * a vocabulary token for the family is literally in SOME source field — checked
+            #     across ALL of them, because the claim itself says "any source field" (a superset
+            #     of the audit's title+body prose); or
+            #   * the deterministic audit classified the family ``unstructured``.
+            # The audit only ever RAISES the bar, never lowers it: a stale audit saying
+            # ``unstructured`` against a since-edited product still blocks the claim, which is the
+            # conservative direction. Recovery already ran above, so reaching here means no value
+            # could be read — the to-do stands, only its CLAIM is downgraded to a truthful one.
+            mention = detect_hit_in_fields(attribute, source_fields)
+            audit_state = audit_states.get(attribute)
+            if drop_reason == DROP_ABSENT and (
+                mention is not None or audit_state == STATE_UNSTRUCTURED
+            ):
+                drop_reason = DROP_MENTIONED_NO_VALUE
             fixes.append(
                 Fix(
                     product_id=product_id, run_id=run_id,
                     type=FixType.merchant_todo, status=FixStatus.proposed,
                     target=f"spec:{attribute}", after_json=None,
-                    reason=_todo_reason(attribute, drop_reason, rejected_value, rejected_field),
-                    # Queryable drop category for a fabrication/mis_assignment to-do (NULL=absent).
-                    source_json=(
-                        None
-                        if drop_reason == "absent"
-                        else [{
-                            "attribute": attribute, "source_field": rejected_field,
-                            "rejected_value": rejected_value, "drop_reason": drop_reason,
-                        }]
+                    reason=_todo_reason(
+                        attribute, drop_reason, rejected_value, rejected_field, mention
+                    ),
+                    # Queryable drop category; SQL NULL only for a true absence claim.
+                    source_json=_todo_evidence(
+                        attribute, drop_reason, rejected_value, rejected_field, mention, audit_state
                     ),
                 )
             )
@@ -511,5 +664,6 @@ async def run_optimizer(
     )
     todos = sum(1 for f in fixes if f.type == FixType.merchant_todo)
     return OptimizerReport(
-        product_id=product_id, run_id=run_id, fillable=fillable, todos=todos, dropped=dropped
+        product_id=product_id, run_id=run_id, fillable=fillable, todos=todos, dropped=dropped,
+        recovered=recovered,
     )

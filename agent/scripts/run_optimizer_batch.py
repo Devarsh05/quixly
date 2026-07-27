@@ -40,15 +40,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from app.graph.optimizer import _build_source_fields
 from app.jobs.fix import propose_fixes_for_shop
 from app.models import AgentRunStatus, Audit, Fix, FixType, Product, QueryPanel, Shop
 from app.services.audit_rubric import (
-    SPEC_FAMILIES,
     SPEC_SCORED_CLASSES,
     applicable_families,
+    detect_hit,
+    detect_hit_in_fields,
     structured_families,
 )
-from app.services.matching import normalize_text
 from app.services.optimizer_llm import OpenAIOptimizerClient
 from app.services.runs import complete_agent_run, create_agent_run
 from app.settings import get_settings
@@ -82,14 +83,11 @@ def _three_state(product: Product) -> tuple[set[str], set[str], set[str]]:
     coffee, and ``structured`` counts the taxonomy-attribute channel (``shopify`` namespace).
     """
     prose_text = f"{product.title or ''} {product.body or ''}"
-    prose = normalize_text(prose_text)
     applicable = set(applicable_families(prose_text))
     structured = structured_families(product.metafields_json) & applicable
-    in_prose = {
-        family
-        for family in applicable
-        if any(normalize_text(p) in prose for p in SPEC_FAMILIES[family].detect)
-    }
+    # ``detect_hit`` is the rubric's own presence test (step 2e). This script used to inline a
+    # third copy of it; sharing the helper is what keeps the report honest about what the audit saw.
+    in_prose = {family for family in applicable if detect_hit(family, prose_text)}
     return structured, in_prose - structured, applicable - in_prose - structured
 
 
@@ -131,11 +129,53 @@ def report_deterministic(products: list[Product], audits: dict[int, Audit]) -> N
           "fills.")
 
 
+# The merchant-facing sentence that ASSERTS ABSENCE (``graph.optimizer._todo_reason``). Any to-do
+# carrying it is claiming the family is in no source field, and must be checkable against source.
+_ABSENCE_CLAIM = "stated in any source field"
+
+
+def report_negative_grounding(products: list[Product], fixes: list[Fix]) -> None:
+    """Re-check every ABSENCE CLAIM the run persisted, against the product's own source fields.
+
+    Deliberately INDEPENDENT of the node: it re-derives the source fields and re-runs the presence
+    test over the persisted rows rather than trusting the report the node returned. A false to-do
+    reads as advice, not a diff, so it survives the approval gate — this is the number that must be
+    zero before the Publisher (step 4) can be built on top of these rows.
+    """
+    print(_rule("NEGATIVE GROUNDING — every absence claim re-checked against source (step 2e)"))
+
+    by_id = {p.id: p for p in products}
+    claims = [
+        f for f in fixes
+        if str(f.type) == str(FixType.merchant_todo)
+        and (f.target or "").startswith("spec:")
+        and _ABSENCE_CLAIM in (f.reason or "")
+    ]
+
+    false_claims = []
+    for fix in claims:
+        product = by_id.get(fix.product_id)
+        if product is None:
+            continue
+        family = fix.target.removeprefix("spec:")
+        mention = detect_hit_in_fields(family, _build_source_fields(product))
+        if mention is not None:
+            false_claims.append((fix.product_id, family, mention))
+
+    print(f"\n  absence claims made      : {len(claims)}")
+    print(f"  FALSE absence claims     : {len(false_claims)}   <-- must be 0")
+    for product_id, family, (field, phrase) in false_claims:
+        print(f"    product={product_id} {family}: claimed absent, but {field} contains {phrase!r}")
+    if not false_claims:
+        print("  every absence claim is literally true of the product's own source fields.")
+
+
 def report_llm(reports: list, fixes: list[Fix]) -> None:
     """Fills and drop counts. Varies run to run — read it next to the pinned model above."""
     print(_rule(f"LLM-DEPENDENT — model={MODEL} reasoning_effort={REASONING_EFFORT}"))
 
     drops = collections.Counter(d.reason for r in reports for d in r.dropped)
+    recovered = [r for report in reports for r in report.recovered]
     # ``fixes.type`` is a plain String column holding a StrEnum value, so rows read back from the
     # DB are ordinary strings — compare/format them as such (StrEnum equality still matches).
     by_type = collections.Counter(str(f.type) for f in fixes)
@@ -149,6 +189,19 @@ def report_llm(reports: list, fixes: list[Fix]) -> None:
         print("  (none)")
     for reason, count in sorted(drops.items()):
         print(f"  {reason:<16} {count:>3}")
+
+    # Step 2e telemetry: families the deterministic scanner read straight out of source after the
+    # extractor failed to ground them. ``missed_as=absent`` is a FALSE ABSENCE CLAIM PREVENTED —
+    # exactly the run-839 bug. A number well above zero is the extractor flakiness showing through
+    # (a separate, still-open backlog item), not a fault in the routing.
+    print(f"\nDETERMINISTIC RECOVERY after an extraction miss ({len(recovered)}):")
+    if not recovered:
+        print("  (none — extraction grounded everything it could this run)")
+    for reason, count in sorted(collections.Counter(r.missed_as for r in recovered).items()):
+        note = "  <-- false 'absent' to-dos prevented" if reason == "absent" else ""
+        print(f"  missed_as={reason:<15} {count:>3}{note}")
+    for rec in recovered:
+        print(f"    {rec.attribute} = {rec.value!r} (from {rec.source_field})")
 
     fills = [
         f for f in fixes if f.type in (FixType.metafield, FixType.description, FixType.category)
@@ -229,6 +282,7 @@ async def main() -> None:
 
         report_deterministic(products, audits)
         report_llm(reports, fixes)
+        report_negative_grounding(products, fixes)
 
         if args.dry_run:
             print("\nDRY RUN — rolling back; no audits/fixes/agent_run rows persisted.")

@@ -177,6 +177,23 @@ they **break the chain and force the merchant to reinstall**.
   HTML-preserving append-list composer `_compose_description`) for every other grounded family.
   Never reintroduce a `custom.*` write unless the L5 Catalog-ingestion question (does Catalog read
   non-mapped `custom.*`?) resolves **positive** — see `docs/decisions/2c-write-target.md`.
+- **Negative claims must be grounded (Optimizer).** A merchant to-do is an assertion about the
+  product, and a false one survives the approval gate because it reads as advice, not a diff. So
+  absence is guarded exactly like presence. An **"absent" to-do is permitted only when** no
+  `SPEC_VOCABULARY` token for the family is literally present in **any** source field **and** the
+  deterministic audit did not classify that family `unstructured` (`audits.gaps_json[].state`).
+  **Extraction returning nothing is NOT evidence of absence** — it is routinely a flaky-LLM miss, so
+  before any family is written off, `audit_rubric.recover_spec_value` tries to read the value
+  straight out of source with no LLM. Recovery **proposes** into the unchanged `ground_attribute` +
+  `validate_spec_value` guards — it is never a second, weaker path into a fix. A family that is
+  mentioned but yields no readable value gets the truthful `mentioned_no_value` to-do tier (which
+  carries its evidence), never an absence claim. The audit is the **authority for absence** and only
+  ever raises the bar, never lowers it. **One vocabulary, no fork:** `SPEC_FAMILIES` is the single
+  definition; `detect` (via `detect_hit`) answers presence, `values`/`kind` (via
+  `validate_spec_value`) answer validity. Cross-family-ambiguous value phrases (today exactly
+  `espresso`, a roast AND a brew method) are refused by recovery for both families — never trade a
+  false negative for a false positive. (Observed: run 839 shipped 14 false absence claims across 9
+  products before this guard.)
 - **Gap→row accounting (Optimizer).** Every family in the Optimizer's `spec_targets` resolves to
   **exactly one** of {taxonomy metafield fill, description line, merchant to-do}, pairwise disjoint
   — asserted in `run_optimizer` before persist. A target producing **zero** rows is always a
@@ -262,6 +279,9 @@ Only items confirmed by committed code or a session log are checked.
 - [x] Grounded Optimizer — structural targeting; taxonomy-attribute / description / `category`
       routing (`custom.*` retired); grounding guard + gap→row accounting invariant; demo seed
       retired (Gates H/L/M). Before/after diff + source per fix
+- [x] Negative grounding (step 2e) — absence claims are guarded like fills: deterministic recovery
+      + negative literal-presence guard + the `mentioned_no_value` to-do tier. Run 839's 14 false
+      absence claims → 0, and 0 even when extraction grounds nothing at all
 - [ ] Preview/approve UI behind the mandatory approval gate (`fixes.status = approved`) — Step 3
 - [ ] Publisher (Admin API writes) — dev store only first, re-read + parse-check after publish;
       resolves the per-shop metaobject GID and requests the settled scope set — Step 4
@@ -278,10 +298,10 @@ Only items confirmed by committed code or a session log are checked.
 - [ ] App Store submission (incl. compliance webhooks `customers/data_request`/`redact`, `shop/redact`)
 - [ ] MCP server
 
-**Next action:** the Optimizer half of Phase 3 is complete. Before Step 4, close the false "absent"
-to-do blocker (`docs/backlog.md` → Optimizer). Then Step 3 (approval UI) and Step 4 (Publisher +
-Admin API writes behind the approval gate, requesting the settled scope set) — both **plan-first**,
-as the first code that writes to live merchant stores.
+**Next action:** the Optimizer half of Phase 3 is complete and the false "absent" to-do blocker is
+closed (step 2e). Next are Step 3 (approval UI) and Step 4 (Publisher + Admin API writes behind the
+approval gate, requesting the settled scope set) — both **plan-first**, as the first code that
+writes to live merchant stores.
 
 ## Session Log
 

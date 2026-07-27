@@ -98,10 +98,21 @@ _GTIN_APPLICABLE_CLASSES = {"equipment"}
 #               label (for open-ended descriptors like tasting notes).
 # ``detect`` tuples are byte-for-byte the old SPEC_VOCABULARY, so rubric detection is unchanged.
 
-# A number followed by an elevation unit (masl / m / ft / meters). "340 g" (a weight) and a bare
-# "340" do not match. ``search`` so a range like "1,900-2,100 masl" still validates.
-_ALTITUDE_RE = re.compile(
-    r"\d[\d,.\s]*(masl|m\.?a\.?s\.?l\.?|met(?:er|re)s?|feet|ft|m)\b", re.IGNORECASE
+# ONE definition of an elevation unit, two patterns over it (they answer different questions):
+_ELEVATION_UNIT = r"(?:masl|m\.?a\.?s\.?l\.?|met(?:er|re)s?|feet|ft|m)"
+
+# VALIDATION — "does this value contain an elevation?" A number followed by an elevation unit
+# (masl / m / ft / meters). "340 g" (a weight) and a bare "340" do not match. ``search`` so a range
+# like "1,900-2,100 masl" still validates.
+_ALTITUDE_RE = re.compile(rf"\d[\d,.\s]*{_ELEVATION_UNIT}\b", re.IGNORECASE)
+
+# RECOVERY — "what is the WHOLE elevation span?" Same units, but it also spans a range separator,
+# which the validation pattern deliberately does not need to. Without this, "1,900-2,100 masl"
+# recovers as "2,100 masl" — literally present and validating, yet it reports the top of a range as
+# *the* altitude. That narrowing is a misrepresentation of the merchant's own copy, so the span
+# pattern must capture the range whole or the value is not safe to publish.
+_ALTITUDE_SPAN_RE = re.compile(
+    rf"\d[\d,.\s]*(?:[-–—]\s*\d[\d,.\s]*)*{_ELEVATION_UNIT}\b", re.IGNORECASE
 )
 
 
@@ -267,6 +278,51 @@ SPEC_VOCABULARY: dict[str, tuple[str, ...]] = {
 }
 
 
+def detect_hit(family: str, text: str) -> str | None:
+    """The first ``SPEC_VOCABULARY[family]`` phrase literally present in ``text``, else ``None``.
+
+    **The PRESENCE question** — "is this family mentioned at all?" — and the audit's own test,
+    extracted verbatim from ``evaluate_product``'s ``in_prose`` comprehension so there is ONE
+    definition with two consumers (CLAUDE.md "one normalizer"):
+
+    * the rubric asks it of the PROSE (title+body) to split ``unstructured`` from ``absent``;
+    * the Optimizer asks it of EVERY source field as the **negative grounding guard** — a
+      merchant-facing "absent" claim is forbidden while any token of the family is literally
+      present (step 2e). Returning the matched *phrase* rather than a bool lets the caller cite
+      what it found, so a downgraded to-do carries its evidence.
+
+    Normalized substring matching (``normalize_text``), NOT whole-word: byte-for-byte the test the
+    rubric has always used, so detection and the three-state classification are unchanged.
+    """
+    spec_phrases = SPEC_VOCABULARY.get(family)
+    if not spec_phrases:
+        return None
+    normalized = normalize_text(text)
+    return next((phrase for phrase in spec_phrases if normalize_text(phrase) in normalized), None)
+
+
+def detect_hit_in_fields(family: str, source_fields: dict[str, str]) -> tuple[str, str] | None:
+    """``(source_field, matched_text)`` for the first field mentioning ``family``, else ``None``.
+
+    The Optimizer's negative guard operates over ALL source fields, not just the prose: an
+    "absent" to-do claims the family is in **no source field**, so the guard must check the same
+    breadth the claim asserts (a superset of the audit's title+body). Field order is the caller's
+    dict order, which ``graph.optimizer._build_source_fields`` fixes — so this is deterministic.
+
+    ``matched_text`` is quoted back to the merchant in a downgraded to-do, so it is the span as
+    THEY wrote it (``"Single-origin"``) rather than the vocabulary spelling (``"single origin"``)
+    wherever the two differ and the span is locatable — detection is normalized-substring, so a
+    phrase matched inside a longer word has no whole-word span and keeps the vocabulary form.
+    """
+    for field_name, text in source_fields.items():
+        if not text:
+            continue
+        phrase = detect_hit(family, text)
+        if phrase is not None:
+            return field_name, _find_original_span(phrase, text) or phrase
+    return None
+
+
 def _normalize_key(text: str) -> str:
     """Normalize a metafield key for comparison. Underscores are word chars to ``normalize_text``
     (so ``roast_level`` would not equal ``roast level``); flatten them to spaces first."""
@@ -346,6 +402,111 @@ def validate_spec_value(family: str, value: str, snippet: str) -> bool:
         )
         return own and not competing
     return False
+
+
+# --- Deterministic value recovery (step 2e) -------------------------------------------------
+# The Optimizer's fallback when the LLM extractor flakily misses a spec that is literally in the
+# source. Pure, LLM-free and keyed on the SAME ``SPEC_FAMILIES`` definition — two projections for
+# two questions, no second vocabulary: ``detect`` answers PRESENCE (above), ``values``/``kind``
+# answer VALUE (here, arbitrated by the unchanged ``validate_spec_value``).
+
+# A value phrase owned by MORE THAN ONE family cannot be deterministically assigned to either, so
+# recovery refuses it. Derived at import time, never hand-maintained: today this is exactly
+# {"espresso"} (a roast level AND a brew method). Without this an "Espresso Roast" product would
+# gain a fabricated ``Brew Method: espresso`` line — trading a false negative for a false positive,
+# which is strictly worse under the never-fabricate rule. The LLM path does not need this guard: a
+# model reads the surrounding sentence, whereas this scan sees only the token.
+def _build_value_owners() -> dict[str, set[str]]:
+    owners: dict[str, set[str]] = {}
+    for family, spec in SPEC_FAMILIES.items():
+        for value in spec.values:
+            owners.setdefault(normalize_text(value), set()).add(family)
+    return owners
+
+
+_AMBIGUOUS_VALUES: frozenset[str] = frozenset(
+    phrase for phrase, owners in _build_value_owners().items() if len(owners) > 1
+)
+
+
+class RecoveredValue(BaseModel):
+    """A spec value recovered deterministically from source text after extraction missed it.
+
+    Shaped to be interchangeable with an LLM ``AttributeCandidate``: the Optimizer puts it through
+    the SAME ``ground_attribute`` + ``validate_spec_value`` guards, so recovery is not a second,
+    weaker path into a fix — it is a second way to *propose* a candidate for the existing guards.
+    """
+
+    family: str
+    value: str
+    source_field: str
+    snippet: str
+
+
+def _find_original_span(term: str, text: str) -> str | None:
+    """Locate ``term`` in ``text`` as a whole word/phrase; return the ORIGINAL-CASED span.
+
+    ``normalize_text`` casefolds and flattens punctuation to spaces, so a value recovered from the
+    normalized form would read ``"ethiopia"``. Merchants see this value in a description line, so
+    the span is taken from the raw text instead — ``"Ethiopia"``. Mirrors ``_contains_term``'s
+    word-boundary semantics (punctuation between words, none inside them), so ``"pour-over"``
+    matches the term ``"pour over"`` while ``"background"`` never matches ``"ground"``.
+    """
+    words = normalize_text(term).split()
+    if not words:
+        return None
+    pattern = r"(?<!\w)" + r"[^\w]+".join(re.escape(word) for word in words) + r"(?!\w)"
+    match = re.search(pattern, text, re.IGNORECASE)
+    return match.group(0) if match else None
+
+
+def recover_spec_value(family: str, source_fields: dict[str, str]) -> RecoveredValue | None:
+    """Recover ``family``'s value from ``source_fields`` deterministically, or ``None``.
+
+    **Gated on presence first** (``detect_hit_in_fields``): a family that is not mentioned is not
+    mined for a value, which is what stops a stray ``"5 m tall"`` from becoming an altitude or a
+    bare ``"ground"`` in unrelated prose from becoming a product form. Per family ``kind``:
+
+    * ``closed`` — the family's own ``values``, longest phrase first so ``"medium dark"`` wins over
+      ``"medium"``; cross-family-ambiguous phrases refused.
+    * ``format`` — the altitude pattern; the matched span IS the value (``"1,900-2,100 masl"``).
+    * ``open``   — **no recovery.** ``tasting_notes`` has no closed vocabulary, so any span this
+      picked would be an invented boundary. It falls to the caller's "mentioned, no value" path.
+
+    Returns ``None`` whenever no value can be read — the caller must then emit a to-do that says
+    so truthfully, never an absence claim.
+    """
+    spec = SPEC_FAMILIES.get(family)
+    if spec is None or detect_hit_in_fields(family, source_fields) is None:
+        return None
+
+    if spec.kind == "closed":
+        # Longest phrase first: "medium dark" must win over "medium" wherever both are present.
+        ordered = sorted(
+            spec.values, key=lambda v: len(normalize_text(v).split()), reverse=True
+        )
+        for value_phrase in ordered:
+            if normalize_text(value_phrase) in _AMBIGUOUS_VALUES:
+                continue
+            for field_name, text in source_fields.items():
+                if not text or not _contains_term(value_phrase, text):
+                    continue
+                span = _find_original_span(value_phrase, text) or value_phrase
+                return RecoveredValue(
+                    family=family, value=span, source_field=field_name, snippet=span
+                )
+        return None
+
+    if spec.kind == "format":
+        for field_name, text in source_fields.items():
+            match = _ALTITUDE_SPAN_RE.search(text or "")
+            if match is not None:
+                span = match.group(0).strip()
+                return RecoveredValue(
+                    family=family, value=span, source_field=field_name, snippet=span
+                )
+    return None
+
 
 # --- Severity weighting ---------------------------------------------------------------------
 # Weighted score → band, over the DISCOVERABLE population. Weights/bands are module constants so
@@ -477,11 +638,10 @@ def evaluate_product(
         applicable = applicable_families(prose)
         applicable_set = set(applicable)
         structured = structured_families(metafields) & applicable_set
-        in_prose = {
-            family
-            for family in applicable
-            if any(normalize_text(phrase) in prose for phrase in SPEC_VOCABULARY[family])
-        }
+        # ``detect_hit`` IS this comprehension's old body, extracted and named (step 2e) so the
+        # rubric and the Optimizer's negative guard can never fork on what "mentioned" means.
+        # Same vocabulary, same normalized substring test — classification is unchanged.
+        in_prose = {family for family in applicable if detect_hit(family, prose)}
         spec_coverage = len(in_prose) / len(applicable)
         # Taxonomy coverage: the headline channel, over applicable taxonomy-home families only.
         home = [f for f in applicable if f in TAXONOMY_HOME_FAMILIES]
