@@ -10,10 +10,22 @@ has ``after_json = NULL`` and a ``reason``; it is informational and **never publ
 step-4 Publisher hard-filters on that). ``missing_gtin`` is always a ``merchant_todo`` — a GTIN
 cannot be derived, and proposing one would violate PRD §13.
 
-Staleness (spike answer C): ``base_source_hash`` is the exact guard, captured at propose over the
-source fields the fix grounded on; ``base_shopify_updated_at`` is a coarse guard populated in
-step 4 (we do not ingest Shopify's ``updatedAt`` yet). Rollback (step 4) appends an inverse row via
-``reverts_fix_id``. ``run_id`` is a nullable FK from day one (standing convention).
+Staleness: ``base_source_hash`` is the coarse per-product guard, captured at propose over a
+**writer-stable** projection of the source fields the fix grounded on
+(``services.catalog.stable_source_hash`` — see its docstring for why the projection, not the raw
+columns). The *exact* per-fix guard is ``before_json``: the Publisher refuses to write unless the
+live field still equals it byte-for-byte. ``base_shopify_updated_at`` remains unpopulated (we do not
+ingest Shopify's ``updatedAt``). Rollback appends an inverse row via ``reverts_fix_id`` — not yet
+built. ``run_id`` is a nullable FK from day one (standing convention).
+
+**Publish audit trail (step 4) — one meaning per column, do not overload either.**
+``published_at`` is set ONLY on a confirmed post-write re-read, never on the mutation's HTTP 200:
+it means "this fix is verified live on the store", and it is what Phase 4's Verifier and any
+staged-rollout audit read. ``publish_error`` carries **why a publish did not land** — a refusal
+(``stale``: the product moved under us) or a failure (``publish_failed``: the write errored or the
+re-read did not confirm) — and is the text the merchant is shown. It is also what distinguishes a
+Publisher-refused ``stale`` row from one Step 3's supersede marked stale, which carries NULL.
+``reason`` keeps purely grounding/to-do semantics and is never written by the Publisher.
 
 ``type`` / ``status`` are plain ``String`` with ``StrEnum`` vocabularies (mirrors
 ``agent_runs.status`` / ``engine_runs.engine`` — adding a value is code-only, no migration).
@@ -47,10 +59,19 @@ class FixType(enum.StrEnum):
 class FixStatus(enum.StrEnum):
     proposed = "proposed"
     approved = "approved"
+    # ``published`` is a real INTERMEDIATE state, committed after the Shopify write and before the
+    # verifying re-read. A crash between the two leaves ``published``, which the next publish run
+    # reconciles by re-reading — it is never re-written. Only a confirmed re-read reaches
+    # ``verified``; a 200 with a wrong or absent result is a failure, not a success.
     published = "published"
     verified = "verified"
     rejected = "rejected"
     stale = "stale"
+    # ``publish_failed`` (step 4): the write errored, its userErrors were non-empty, or the
+    # post-write re-read did not confirm. TERMINAL and never auto-retried — a silent retry of an
+    # append-only description write is exactly the double-append this state exists to prevent. The
+    # cause lives in ``publish_error``. Code-only addition: ``status`` is a plain ``String(16)``.
+    publish_failed = "publish_failed"
     reverted = "reverted"
 
 
@@ -91,6 +112,10 @@ class Fix(Base):
     reverts_fix_id: Mapped[int | None] = mapped_column(
         ForeignKey("fixes.id", ondelete="SET NULL"), nullable=True
     )
+
+    # Publish audit trail (step 4) — see the module docstring. NULL on every non-published row.
+    publish_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

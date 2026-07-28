@@ -27,12 +27,13 @@ invariant is: **no approvable path to a write that cannot execute.**
 """
 
 import re
+from datetime import datetime
 from typing import Annotated
 
 from arq.connections import ArqRedis, RedisSettings, create_pool
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_internal_api_key
@@ -50,6 +51,19 @@ DbSession = Annotated[AsyncSession, Depends(get_db)]
 # Fix types a merchant may act on. ``metafield`` (taxonomy) is deliberately absent — see the module
 # docstring. ``merchant_todo`` is informational and has no ``after_json`` to publish.
 APPROVABLE_TYPES = frozenset({FixType.description, FixType.category})
+
+# Everything past the gate. ``approved`` is the Publisher's work set; the rest are its results.
+POST_APPROVAL_STATUSES = (
+    FixStatus.approved,
+    FixStatus.published,
+    FixStatus.verified,
+    FixStatus.publish_failed,
+)
+# Terminal publish outcomes the merchant is shown as "what happened". ``stale`` joins these at
+# render time only when the Publisher left a ``publish_error`` on it (see ``list_fixes``).
+SETTLED_STATUSES = frozenset(
+    {FixStatus.published, FixStatus.verified, FixStatus.publish_failed, FixStatus.stale}
+)
 
 # Why a non-approvable row is non-approvable, shown to the merchant verbatim.
 BLOCK_REASONS: dict[str, str] = {
@@ -89,6 +103,11 @@ class FixView(BaseModel):
     citations: list[Citation]
     approvable: bool
     block_reason: str | None
+    # Publish audit trail (step 4). ``publish_error`` is why a publish did not land — a stale
+    # refusal or a failed write — and the shell shows it verbatim, so a failure never reads as a
+    # dead end. ``published_at`` is set only on a confirmed re-read.
+    publish_error: str | None = None
+    published_at: datetime | None = None
     # Type-specific render payload; exactly one is populated.
     added_lines: list[AddedLine] = []
     category_from: str | None = None
@@ -104,12 +123,20 @@ class ProductFixes(BaseModel):
     approvable: list[FixView]
     not_publishable: list[FixView]
     needs_input: list[FixView]
+    # Step 4. ``ready`` = approved, awaiting publish — exactly the Publisher's work set, so the
+    # merchant never sees fewer rows than we would write. ``settled`` = the outcome of a publish
+    # run (published / verified / publish_failed, and any row the staleness gate refused).
+    ready: list[FixView] = []
+    settled: list[FixView] = []
 
 
 class FixListResponse(BaseModel):
     run_id: int | None
     status: AgentRunStatus | None
     products: list[ProductFixes]
+    # Set only when the caller passes ``publish_run_id`` — see ``list_fixes``.
+    publish_run_id: int | None = None
+    publish_status: AgentRunStatus | None = None
 
 
 class FixRunResponse(BaseModel):
@@ -123,9 +150,17 @@ class FixDecisionResponse(BaseModel):
 
 
 async def _enqueue(run_id: int) -> None:
+    await _enqueue_job("run_fix_task", run_id)
+
+
+async def _enqueue_publish(run_id: int) -> None:
+    await _enqueue_job("run_publish_task", run_id)
+
+
+async def _enqueue_job(name: str, run_id: int) -> None:
     pool: ArqRedis = await create_pool(RedisSettings.from_dsn(get_settings().redis_url))
     try:
-        await pool.enqueue_job("run_fix_task", run_id)
+        await pool.enqueue_job(name, run_id)
     finally:
         await pool.aclose()
 
@@ -178,6 +213,8 @@ def _to_view(fix: Fix) -> FixView:
         citations=[Citation(**c) for c in (fix.source_json or []) if isinstance(c, dict)],
         approvable=approvable,
         block_reason=None if approvable else BLOCK_REASONS.get(fix.type),
+        publish_error=fix.publish_error,
+        published_at=fix.published_at,
     )
 
     if fix.type == FixType.description:
@@ -225,25 +262,84 @@ async def start_fix_run(shop_domain: str, db: DbSession) -> FixRunResponse:
     return FixRunResponse(run_id=run.id, status=run.status)
 
 
+@router.post(
+    "/by-domain/{shop_domain}/fixes/publish",
+    response_model=FixRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_internal_api_key)],
+)
+async def start_publish(shop_domain: str, db: DbSession) -> FixRunResponse:
+    """Enqueue a publish run — THE ONLY ROUTE IN THIS SERVICE THAT LEADS TO A MERCHANT WRITE.
+
+    It writes no ``fixes`` row itself and takes no fix ids: the work set is exactly the shop's
+    ``approved`` rows, so a crafted request cannot widen what gets published beyond what the
+    merchant individually approved. A shop with nothing approved gets a 409 rather than an empty
+    run, so "publish" never silently does nothing.
+
+    The staged-rollout allowlist is enforced in the job, not here — the guard belongs next to the
+    write, where no other caller can route around it.
+    """
+    shop = await _resolve_shop(db, shop_domain)
+
+    approved = await db.scalar(
+        select(func.count())
+        .select_from(Fix)
+        .join(Product, Product.id == Fix.product_id)
+        .where(Product.shop_id == shop.id, Fix.status == FixStatus.approved)
+    )
+    if not approved:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Nothing is approved for this shop, so there is nothing to publish.",
+        )
+
+    panel_id = await upsert_panel(db, build_query_panel(), shop.id)
+    run = await create_agent_run(db, shop.id, panel_id)
+    await db.commit()  # load-bearing: the run must exist before the job is enqueued
+
+    await _enqueue_publish(run.id)
+
+    return FixRunResponse(run_id=run.id, status=run.status)
+
+
 @router.get(
     "/by-domain/{shop_domain}/fixes",
     response_model=FixListResponse,
     dependencies=[Depends(require_internal_api_key)],
 )
 async def list_fixes(
-    shop_domain: str, db: DbSession, run_id: int | None = None
+    shop_domain: str,
+    db: DbSession,
+    run_id: int | None = None,
+    publish_run_id: int | None = None,
 ) -> FixListResponse:
-    """Proposed fixes for a run, grouped by product and pre-rendered.
+    """Fixes for a run, grouped by product and pre-rendered.
 
-    RUN-SCOPED (mirrors ``get_report``): only the resolved run's ``proposed`` rows are returned, so
-    superseded proposals from earlier runs are never shown — no writes needed to hide them.
+    **Two different scopes, deliberately.** ``proposed`` rows are RUN-SCOPED (mirrors
+    ``get_report``), so superseded proposals from earlier runs are never shown — no writes needed
+    to hide them. Everything past approval is SHOP-SCOPED, because the Publisher publishes every
+    approved row for the shop regardless of which run proposed it. Run-scoping that half would show
+    the merchant fewer rows than we would actually write, which is exactly the surprise the
+    approval gate exists to prevent.
 
     With no ``run_id``, resolves the latest run that actually PRODUCED fixes. ``agent_runs`` has no
     run-kind discriminator (backlog), so "the latest fix run" is derived from the fixes themselves,
     which is exact for this purpose. A shop that has never proposed a fix gets an empty payload,
     not a 404 — "nothing to approve yet" is a normal state the page renders.
+
+    ``publish_run_id`` is echoed back with its status so the shell can poll a publish in flight
+    without needing a run-kind discriminator: the 202 from ``start_publish`` hands the shell the
+    id, and the shell hands it back here.
     """
     shop = await _resolve_shop(db, shop_domain)
+
+    publish_status = None
+    if publish_run_id is not None:
+        publish_status = await db.scalar(
+            select(AgentRun.status).where(
+                AgentRun.id == publish_run_id, AgentRun.shop_id == shop.id
+            )
+        )
 
     if run_id is None:
         run_id = await db.scalar(
@@ -253,7 +349,13 @@ async def list_fixes(
             .where(Product.shop_id == shop.id)
         )
     if run_id is None:
-        return FixListResponse(run_id=None, status=None, products=[])
+        return FixListResponse(
+            run_id=None,
+            status=None,
+            products=[],
+            publish_run_id=publish_run_id,
+            publish_status=publish_status,
+        )
 
     run = (
         await db.execute(
@@ -269,8 +371,16 @@ async def list_fixes(
             .join(Product, Product.id == Fix.product_id)
             .where(
                 Product.shop_id == shop.id,
-                Fix.run_id == run_id,
-                Fix.status == FixStatus.proposed,
+                or_(
+                    # The gate: this run's undecided proposals.
+                    and_(Fix.run_id == run_id, Fix.status == FixStatus.proposed),
+                    # The Publisher's work set and its results, across every run.
+                    Fix.status.in_(POST_APPROVAL_STATUSES),
+                    # A row the staleness gate REFUSED. ``stale`` is overloaded — Step 3's
+                    # supersede uses it too — so it is shown only when the Publisher left a
+                    # cause on it. A supersede-stale row carries NULL and stays hidden.
+                    and_(Fix.status == FixStatus.stale, Fix.publish_error.is_not(None)),
+                ),
             )
             .order_by(Product.id, Fix.id)
         )
@@ -305,7 +415,11 @@ async def list_fixes(
             grouped[product.id] = entry
 
         view = _to_view(fix)
-        if view.approvable:
+        if fix.status == FixStatus.approved:
+            entry.ready.append(view)
+        elif fix.status in SETTLED_STATUSES:
+            entry.settled.append(view)
+        elif view.approvable:
             entry.approvable.append(view)
         elif fix.type == FixType.merchant_todo:
             entry.needs_input.append(view)
@@ -313,7 +427,11 @@ async def list_fixes(
             entry.not_publishable.append(view)
 
     return FixListResponse(
-        run_id=run_id, status=run.status, products=list(grouped.values())
+        run_id=run_id,
+        status=run.status,
+        products=list(grouped.values()),
+        publish_run_id=publish_run_id,
+        publish_status=publish_status,
     )
 
 

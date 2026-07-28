@@ -51,9 +51,6 @@ executes writes behind the approval gate. The LLM client is injected so tests dr
 client against the transaction-scoped ``db`` fixture.
 """
 
-import hashlib
-import json
-import re
 from html import escape
 
 from pydantic import BaseModel
@@ -72,6 +69,7 @@ from app.services.audit_rubric import (
     structured_families,
     validate_spec_value,
 )
+from app.services.catalog import stable_source_hash, strip_html
 from app.services.matching import is_grounded
 from app.services.optimizer_llm import AttributeCandidate, OptimizerClient
 from app.services.taxonomy_map import (
@@ -79,8 +77,6 @@ from app.services.taxonomy_map import (
     CATEGORY_COFFEE_CONCENTRATE,
     resolve_taxonomy_value,
 )
-
-_HTML_TAG = re.compile(r"<[^>]+>")
 
 
 class DroppedCandidate(BaseModel):
@@ -139,10 +135,6 @@ def ground_attribute(candidate: AttributeCandidate, source_fields: dict[str, str
     return candidate.value if snippet_in_field and value_in_snippet else None
 
 
-def _strip_html(text: str | None) -> str:
-    return _HTML_TAG.sub(" ", text or "")
-
-
 def _variants_text(variants: list | None) -> str:
     parts: list[str] = []
     for variant in variants or []:
@@ -163,16 +155,11 @@ def _build_source_fields(product: Product) -> dict[str, str]:
     """The product's own fields as named text blobs — the only grounding sources (tags deferred)."""
     return {
         "title": product.title or "",
-        "body_html": _strip_html(product.body).strip(),
+        "body_html": strip_html(product.body).strip(),
         "variants_json": _variants_text(product.variants_json),
         "metafields": _metafields_text(product.metafields_json),
         "product_type": product.product_type or "",
     }
-
-
-def _source_hash(source_fields: dict[str, str]) -> str:
-    canonical = json.dumps(source_fields, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 _CONCENTRATE_TERMS = ("concentrate", "instant")
@@ -212,7 +199,7 @@ def _infer_coffee_category(product: Product) -> tuple[str, str, dict] | None:
     signal can be cited (then no auto-proposal — a merchant to-do, per the approval bar).
     """
     for field in ("product_type", "title", "body"):
-        raw = getattr(product, field) if field != "body" else _strip_html(product.body)
+        raw = getattr(product, field) if field != "body" else strip_html(product.body)
         text = (raw or "")
         low = text.casefold()
         if not low.strip():
@@ -367,7 +354,11 @@ async def run_optimizer(
 
     gaps = audit.gaps_json or []
     source_fields = _build_source_fields(product)
-    base_hash = _source_hash(source_fields)
+    # The staleness guard the Publisher re-computes from a LIVE re-read, so it must be
+    # writer-stable — see ``stable_source_hash``. Deliberately NOT hashed over ``source_fields``:
+    # that projection feeds extraction, and it hashes raw ``variants_json``, whose stored shape
+    # differs between the ingest writer and the products/update webhook writer.
+    base_hash = stable_source_hash(product)
 
     # TARGETING IS STRUCTURAL, NOT GAP-DERIVED (step 2b), and APPLICABILITY-GATED (step 2d). Targets
     # are the spec families APPLICABLE to this product (``applicable_families`` drops

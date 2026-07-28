@@ -1,13 +1,15 @@
 /**
- * The approval gate (Phase 3, step 3) — review proposed fixes and approve or reject them.
+ * The approval gate (step 3) and the publish trigger (step 4) — review fixes, approve them, and
+ * send the approved ones to the store.
  *
- * **Nothing here writes to Shopify.** An approval flips `fixes.status` proposed -> approved; the
- * step-4 Publisher is what later acts on approved rows. This page reads and decides, nothing else.
+ * **Approving still writes nothing to Shopify.** It flips `fixes.status` proposed -> approved.
+ * Publishing is a SECOND, explicit merchant action, and it publishes exactly the approved rows —
+ * the request carries no fix ids, so it can never widen past what was individually approved.
  *
- * Mirrors `app.audit.tsx` exactly: `authenticate.admin` loader -> typed agent client -> Polaris
- * `s-*` components -> `boundary.headers`, polling only while a run is in flight. The shell holds
- * NO business logic: the agent already decided what is approvable, what each fix's readable diff
- * is, and why a blocked row is blocked (CLAUDE.md: keep the app shell thin).
+ * Mirrors `app.audit.tsx`: `authenticate.admin` loader -> typed agent client -> Polaris `s-*`
+ * components -> `boundary.headers`, polling only while a run is in flight. The shell holds NO
+ * business logic: the agent decides what is approvable, what is ready to publish, what each fix's
+ * readable diff is, and why anything failed (CLAUDE.md: keep the app shell thin).
  */
 
 import { useEffect } from "react";
@@ -20,19 +22,35 @@ import { Form, redirect, useLoaderData, useRevalidator } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 
 import type { FixView, ProductFixes } from "../lib/agent.server";
-import { decideFix, getFixes, startFixRun } from "../lib/agent.server";
+import {
+  decideFix,
+  getFixes,
+  publishFixes,
+  startFixRun,
+} from "../lib/agent.server";
 import { authenticate } from "../shopify.server";
+
+function numericParam(url: URL, name: string): number | undefined {
+  const raw = url.searchParams.get(name);
+  return raw && /^\d+$/.test(raw) ? Number(raw) : undefined;
+}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
 
-  const runIdParam = new URL(request.url).searchParams.get("run_id");
-  const runId = runIdParam && /^\d+$/.test(runIdParam) ? Number(runIdParam) : undefined;
+  const url = new URL(request.url);
+  const runId = numericParam(url, "run_id");
+  // Carried in the URL so the page can poll a publish in flight — `agent_runs` has no run-kind
+  // discriminator, so the id the 202 handed us is what identifies it.
+  const publishRunId = numericParam(url, "publish_run_id");
 
   // The agent may be briefly unreachable; that must degrade this page (a banner), not break it —
   // and it is DISTINCT from "this shop has no fixes yet" (run_id === null).
   try {
-    return { fixes: await getFixes(session.shop, runId), agentReachable: true };
+    return {
+      fixes: await getFixes(session.shop, runId, publishRunId),
+      agentReachable: true,
+    };
   } catch {
     return { fixes: null, agentReachable: false };
   }
@@ -48,6 +66,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (intent === "run") {
     const { run_id } = await startFixRun(session.shop);
     return redirect(`/app/fixes?run_id=${run_id}`);
+  }
+
+  if (intent === "publish") {
+    const { run_id } = await publishFixes(session.shop);
+    const existing = new URL(request.url).searchParams.get("run_id");
+    const scope = existing ? `run_id=${existing}&` : "";
+    return redirect(`/app/fixes?${scope}publish_run_id=${run_id}`);
   }
 
   const fixId = Number(form.get("fix_id"));
@@ -173,6 +198,56 @@ function NotPublishableFix({ fix }: { fix: FixView }) {
   );
 }
 
+/** One line describing what a fix does, for the lists where the full diff is already reviewed. */
+function fixSummary(fix: FixView): string {
+  if (fix.type === "category") return `Set category to ${fix.category_to}`;
+  if (fix.type === "description") {
+    const count = fix.added_lines.length;
+    return `Add ${count} detail line${count === 1 ? "" : "s"} to the description`;
+  }
+  return fix.target;
+}
+
+/** Approved and waiting. This list is exactly what Publish would write — never more. */
+function ReadyFix({ fix }: { fix: FixView }) {
+  return (
+    <s-stack direction="inline" gap="small-300">
+      <s-badge tone="caution">Ready</s-badge>
+      <s-text>{fixSummary(fix)}</s-text>
+    </s-stack>
+  );
+}
+
+/**
+ * What a publish run actually did. A failure is never a dead end: the agent's `publish_error` says
+ * why — the write was refused, or the product changed after approval — and is shown verbatim.
+ *
+ * `verified` is the ONLY success state: it means we re-read the product from Shopify afterwards
+ * and confirmed the change is live. A `published` row is mid-flight, not a success.
+ */
+function SettledFix({ fix }: { fix: FixView }) {
+  const tone =
+    fix.status === "verified" ? "success" : fix.status === "published" ? "info" : "critical";
+  const label =
+    fix.status === "verified"
+      ? "Live"
+      : fix.status === "published"
+        ? "Confirming…"
+        : fix.status === "stale"
+          ? "Skipped"
+          : "Didn't publish";
+
+  return (
+    <s-stack direction="block" gap="small-500">
+      <s-stack direction="inline" gap="small-300">
+        <s-badge tone={tone}>{label}</s-badge>
+        <s-text>{fixSummary(fix)}</s-text>
+      </s-stack>
+      {fix.publish_error && <s-text color="subdued">{fix.publish_error}</s-text>}
+    </s-stack>
+  );
+}
+
 function ProductCard({ product }: { product: ProductFixes }) {
   const category = product.approvable.filter((f) => f.type === "category");
   const routine = product.approvable.filter((f) => f.type !== "category");
@@ -181,6 +256,24 @@ function ProductCard({ product }: { product: ProductFixes }) {
     <s-section heading={product.title ?? `Product ${product.product_id}`}>
       <s-stack direction="block" gap="large">
         {product.severity && <s-badge tone="info">{product.severity} priority</s-badge>}
+
+        {product.settled.length > 0 && (
+          <s-stack direction="block" gap="base">
+            <s-heading>Publish results</s-heading>
+            {product.settled.map((fix) => (
+              <SettledFix key={fix.id} fix={fix} />
+            ))}
+          </s-stack>
+        )}
+
+        {product.ready.length > 0 && (
+          <s-stack direction="block" gap="base">
+            <s-heading>Approved, ready to publish</s-heading>
+            {product.ready.map((fix) => (
+              <ReadyFix key={fix.id} fix={fix} />
+            ))}
+          </s-stack>
+        )}
 
         {/* Publish-class first, visually separated. */}
         {category.map((fix) => (
@@ -220,15 +313,19 @@ export default function Fixes() {
   const revalidator = useRevalidator();
 
   const running = fixes?.status === "running";
+  const publishing = fixes?.publish_status === "running";
+  const inFlight = running || publishing;
 
   // Poll only while a run is in flight. completed / failed are terminal — never spin forever.
   useEffect(() => {
-    if (!running) return;
+    if (!inFlight) return;
     const timer = setInterval(() => revalidator.revalidate(), POLL_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [running, revalidator]);
+  }, [inFlight, revalidator]);
 
   const hasProducts = (fixes?.products.length ?? 0) > 0;
+  const readyCount =
+    fixes?.products.reduce((total, product) => total + product.ready.length, 0) ?? 0;
 
   return (
     <s-page heading="Review fixes">
@@ -292,13 +389,57 @@ export default function Fixes() {
         </s-section>
       )}
 
-      {/* 6. The gate itself. */}
+      {/* 6. A publish run is in flight. */}
+      {publishing && (
+        <s-section heading="Publishing to your store">
+          <s-stack direction="block" gap="base">
+            <s-paragraph>
+              Sending your approved changes, then re-reading each product to confirm they landed…
+            </s-paragraph>
+            <s-spinner accessibilityLabel="Publishing" />
+          </s-stack>
+        </s-section>
+      )}
+
+      {/* 7. A publish run failed before it wrote anything. */}
+      {fixes?.publish_status === "failed" && (
+        <s-section heading="Publishing">
+          <s-banner tone="critical" heading="That publish run didn't finish">
+            <s-paragraph>
+              Nothing partial was left behind — every change is either live and confirmed, or
+              untouched and still approved. See each product below for detail.
+            </s-paragraph>
+          </s-banner>
+        </s-section>
+      )}
+
+      {/* 8. THE PUBLISH TRIGGER — the only control on this page that writes to the store. */}
+      {readyCount > 0 && !publishing && (
+        <s-section heading="Publish approved changes">
+          <s-stack direction="block" gap="base">
+            <s-paragraph>
+              {readyCount} approved change{readyCount === 1 ? "" : "s"} will be written to your
+              store. Each one is re-checked against the live product first and confirmed by
+              re-reading it afterwards — anything that changed since you approved it is skipped,
+              not forced through.
+            </s-paragraph>
+            <Form method="post">
+              <input type="hidden" name="intent" value="publish" />
+              <s-button type="submit" variant="primary">
+                Publish {readyCount} change{readyCount === 1 ? "" : "s"}
+              </s-button>
+            </Form>
+          </s-stack>
+        </s-section>
+      )}
+
+      {/* 9. The gate itself. */}
       {hasProducts && (
         <>
           <s-section heading="Approve what goes live">
             <s-paragraph>
-              Nothing below has been sent to your store. Each change shows exactly what it edits
-              and where the information came from.
+              Approving does not send anything to your store — publishing is a separate step. Each
+              change shows exactly what it edits and where the information came from.
             </s-paragraph>
           </s-section>
           {fixes?.products.map((product) => (

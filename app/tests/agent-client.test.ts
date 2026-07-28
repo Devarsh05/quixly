@@ -6,7 +6,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { getReport, startScan } from "../app/lib/agent.server";
+import { getFixes, getReport, publishFixes, startScan } from "../app/lib/agent.server";
 
 const AGENT_URL = "http://agent.test";
 const KEY = "test-internal-key";
@@ -66,6 +66,51 @@ describe("agent.server scan/report client", () => {
     it("throws when INTERNAL_API_KEY is unset", async () => {
       vi.stubEnv("INTERNAL_API_KEY", "");
       await expect(startScan(SHOP)).rejects.toThrow(/INTERNAL_API_KEY/);
+    });
+  });
+
+  describe("publishFixes", () => {
+    it("POSTs to the publish URL with the internal key and an EMPTY body", async () => {
+      // The body carrying no fix ids is the guarantee: the agent publishes exactly the shop's
+      // approved rows, so nothing the caller sends can widen what reaches the store.
+      fetchMock.mockResolvedValue(jsonResponse({ run_id: 12, status: "running" }));
+
+      const result = await publishFixes(SHOP);
+
+      expect(result).toEqual({ run_id: 12, status: "running" });
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe(`${AGENT_URL}/shops/by-domain/${encodeURIComponent(SHOP)}/fixes/publish`);
+      expect((init as { method: string }).method).toBe("POST");
+      expect((init as { body: string }).body).toBe("{}");
+      expect(headerOf(init, "X-Internal-Api-Key")).toBe(KEY);
+    });
+
+    it("throws on a non-OK response — a 409 'nothing approved' is never a silent no-op", async () => {
+      fetchMock.mockResolvedValue(jsonResponse({ detail: "nothing approved" }, 409));
+      await expect(publishFixes(SHOP)).rejects.toThrow(/409/);
+    });
+  });
+
+  describe("getFixes", () => {
+    it("threads run_id and publish_run_id into the query string", async () => {
+      fetchMock.mockResolvedValue(jsonResponse({ run_id: 3, status: "completed", products: [] }));
+
+      await getFixes(SHOP, 3, 12);
+
+      const [url] = fetchMock.mock.calls[0];
+      expect(url).toBe(
+        `${AGENT_URL}/shops/by-domain/${encodeURIComponent(SHOP)}/fixes?run_id=3&publish_run_id=12`,
+      );
+    });
+
+    it("omits the query string entirely when neither id is given", async () => {
+      fetchMock.mockResolvedValue(jsonResponse({ run_id: null, status: null, products: [] }));
+
+      await getFixes(SHOP);
+
+      expect(fetchMock.mock.calls[0][0]).toBe(
+        `${AGENT_URL}/shops/by-domain/${encodeURIComponent(SHOP)}/fixes`,
+      );
     });
   });
 

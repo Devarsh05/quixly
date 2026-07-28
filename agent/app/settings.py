@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     # Shopify Admin API version — must match `api_version` in app/shopify.app.toml.
     shopify_api_version: str = "2026-07"
 
+    # STAGED ROLLOUT GATE for the Publisher (step 4) — the first code that writes to a live
+    # merchant store. Comma-separated allowlist; a shop not on it is REFUSED, loudly, before any
+    # write. Defaults to the dev store alone: no real merchant until the full
+    # write → re-read → verify path is proven end-to-end. Widening this is a deliberate change,
+    # never an incidental one.
+    publish_allowed_shops: str = "quixly-ljymkoyb.myshopify.com"
+
     # AI shopping-engine API keys (optional until Phase 2 wiring; no secret defaults).
     # SecretStr so the key can never surface in a repr, log line, or traceback.
     perplexity_api_key: SecretStr = Field(default=SecretStr(""))

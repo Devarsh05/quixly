@@ -16,12 +16,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const getFixes = vi.fn();
 const startFixRun = vi.fn();
 const decideFix = vi.fn();
+const publishFixes = vi.fn();
 const authenticateAdmin = vi.fn();
 
 vi.mock("../app/lib/agent.server", () => ({
   getFixes: (...args: unknown[]) => getFixes(...args),
   startFixRun: (...args: unknown[]) => startFixRun(...args),
   decideFix: (...args: unknown[]) => decideFix(...args),
+  publishFixes: (...args: unknown[]) => publishFixes(...args),
 }));
 
 vi.mock("../app/shopify.server", () => ({
@@ -43,10 +45,10 @@ function callLoader(url = "http://localhost/app/fixes") {
   } as unknown as Parameters<typeof loader>[0]);
 }
 
-function callAction(body: Record<string, string>) {
+function callAction(body: Record<string, string>, url = "http://localhost/app/fixes") {
   const form = new URLSearchParams(body);
   return action({
-    request: new Request("http://localhost/app/fixes", { method: "POST", body: form }),
+    request: new Request(url, { method: "POST", body: form }),
   } as unknown as Parameters<typeof action>[0]) as Promise<Response>;
 }
 
@@ -54,6 +56,7 @@ beforeEach(() => {
   getFixes.mockReset();
   startFixRun.mockReset();
   decideFix.mockReset();
+  publishFixes.mockReset();
   authenticateAdmin.mockReset();
   authenticateAdmin.mockResolvedValue({ session: { shop: SHOP } });
 });
@@ -64,18 +67,29 @@ describe("app.fixes loader", () => {
 
     await callLoader("http://localhost/app/fixes?shop=attacker.myshopify.com");
 
-    expect(getFixes).toHaveBeenCalledWith(SHOP, undefined);
+    expect(getFixes).toHaveBeenCalledWith(SHOP, undefined, undefined);
   });
 
   it("threads a numeric run_id through and ignores a non-numeric one", async () => {
     getFixes.mockResolvedValue(EMPTY);
 
     await callLoader("http://localhost/app/fixes?run_id=42");
-    expect(getFixes).toHaveBeenCalledWith(SHOP, 42);
+    expect(getFixes).toHaveBeenCalledWith(SHOP, 42, undefined);
 
     getFixes.mockClear();
     await callLoader("http://localhost/app/fixes?run_id=not-a-number");
-    expect(getFixes).toHaveBeenCalledWith(SHOP, undefined);
+    expect(getFixes).toHaveBeenCalledWith(SHOP, undefined, undefined);
+  });
+
+  it("threads publish_run_id through so a publish in flight can be polled", async () => {
+    getFixes.mockResolvedValue(EMPTY);
+
+    await callLoader("http://localhost/app/fixes?run_id=42&publish_run_id=99");
+    expect(getFixes).toHaveBeenCalledWith(SHOP, 42, 99);
+
+    getFixes.mockClear();
+    await callLoader("http://localhost/app/fixes?publish_run_id=oops");
+    expect(getFixes).toHaveBeenCalledWith(SHOP, undefined, undefined);
   });
 
   it("returns the payload with agentReachable when the agent responds", async () => {
@@ -110,6 +124,39 @@ describe("app.fixes action", () => {
     expect(startFixRun).toHaveBeenCalledWith(SHOP);
     expect(response.status).toBe(302);
     expect(response.headers.get("location")).toBe("/app/fixes?run_id=91");
+  });
+
+  it("publishes for the SESSION's shop and carries no fix ids", async () => {
+    // The publish request must not be able to name what gets written: the work set is the shop's
+    // approved rows, so a crafted form field can never widen it past what was approved.
+    publishFixes.mockResolvedValue({ run_id: 77, status: "running" });
+
+    const response = await callAction({ intent: "publish", fix_id: "1234" });
+
+    expect(publishFixes).toHaveBeenCalledWith(SHOP);
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe("/app/fixes?publish_run_id=77");
+  });
+
+  it("keeps the reviewed run in scope when publishing from a run-scoped URL", async () => {
+    publishFixes.mockResolvedValue({ run_id: 78, status: "running" });
+
+    const response = await callAction(
+      { intent: "publish" },
+      "http://localhost/app/fixes?run_id=42",
+    );
+
+    expect(response.headers.get("location")).toBe("/app/fixes?run_id=42&publish_run_id=78");
+  });
+
+  it("never publishes while approving or running — publishing is its own explicit action", async () => {
+    decideFix.mockResolvedValue({ fix_id: 5, status: "approved" });
+    startFixRun.mockResolvedValue({ run_id: 91, status: "running" });
+
+    await callAction({ intent: "approve", fix_id: "5" });
+    await callAction({ intent: "run" });
+
+    expect(publishFixes).not.toHaveBeenCalled();
   });
 
   it("approves a fix for the SESSION's shop", async () => {

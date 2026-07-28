@@ -20,31 +20,77 @@ logger = logging.getLogger(__name__)
 
 MAX_THROTTLE_RETRIES = 5
 
-PRODUCTS_QUERY = """
-query CatalogPage($cursor: String) {
-  products(first: 50, after: $cursor) {
-    pageInfo { hasNextPage endCursor }
-    nodes {
-      id
-      title
-      descriptionHtml
-      status
-      productType
-      category { name fullName }
-      variants(first: 100) {
-        nodes { id title sku barcode price inventoryQuantity }
-      }
-      metafields(first: 50) {
-        nodes { namespace key value type }
-      }
-    }
+# The product fields we persist. Kept as one fragment so the paged catalog read and the
+# Publisher's single-product re-read select IDENTICALLY — the Publisher's staleness hash is
+# computed over a live read and compared against what ingest stored, so a field selected by one
+# and not the other would silently change the digest.
+PRODUCT_FIELDS = """
+fragment ProductFields on Product {
+  id
+  title
+  descriptionHtml
+  status
+  productType
+  category { id name fullName }
+  variants(first: 100) {
+    nodes { id title sku barcode price inventoryQuantity }
+  }
+  metafields(first: 50) {
+    nodes { namespace key value type }
   }
 }
 """
 
+PRODUCTS_QUERY = (
+    PRODUCT_FIELDS
+    + """
+query CatalogPage($cursor: String) {
+  products(first: 50, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes { ...ProductFields }
+  }
+}
+"""
+)
+
+PRODUCT_QUERY = (
+    PRODUCT_FIELDS
+    + """
+query OneProduct($id: ID!) {
+  product(id: $id) { ...ProductFields }
+}
+"""
+)
+
+# The publish mutation for BOTH proven write paths (docs/decisions/2c-write-target.md L1): the
+# scalar-GID `category` assign and the append-only `descriptionHtml` write. Uses the modern
+# `product:` argument, which is the form proven live. It returns the full field set so the caller
+# *could* read the result — but the Publisher deliberately does NOT verify from it: confirming a
+# write with the same round trip that performed it proves nothing. Verification is a fresh read.
+PRODUCT_UPDATE_MUTATION = (
+    PRODUCT_FIELDS
+    + """
+mutation PublishFix($product: ProductUpdateInput!) {
+  productUpdate(product: $product) {
+    product { ...ProductFields }
+    userErrors { field message }
+  }
+}
+"""
+)
+
 
 class ShopifyAdminError(RuntimeError):
     """A non-recoverable error talking to the Shopify Admin API."""
+
+
+class ShopifyWriteError(ShopifyAdminError):
+    """A mutation reported ``userErrors``.
+
+    Load-bearing as its own type: ``productUpdate`` returns **HTTP 200 with a non-empty
+    ``userErrors``** when it refuses a write, so a caller that only checks the transport status
+    reads a rejection as a success. This turns that into a raise.
+    """
 
 
 class ShopifyAdminClient:
@@ -106,6 +152,42 @@ class ShopifyAdminClient:
             f"Still throttled by Shopify after {MAX_THROTTLE_RETRIES} attempts "
             f"for {self._shop_domain}."
         )
+
+    async def fetch_product(self, product_gid: str) -> dict[str, Any] | None:
+        """Read ONE product with the same field set the catalog ingest selects.
+
+        Returns ``None`` when the product no longer exists (deleted between propose and publish) —
+        a normal condition the Publisher must handle, not an error.
+        """
+        data = await self.execute(PRODUCT_QUERY, {"id": product_gid})
+        return data.get("product")
+
+    async def update_product(self, product_input: dict[str, Any]) -> dict[str, Any]:
+        """Run ``productUpdate`` and return the updated node, raising on ``userErrors``.
+
+        ``product_input`` must carry ``id`` plus exactly the fields being written
+        (``descriptionHtml`` or ``category``). The returned node is for logging only — the
+        Publisher verifies with a separate re-read, never with this payload.
+        """
+        data = await self.execute(PRODUCT_UPDATE_MUTATION, {"product": product_input})
+        result = data.get("productUpdate") or {}
+
+        if user_errors := result.get("userErrors"):
+            written = sorted(k for k in product_input if k != "id")
+            raise ShopifyWriteError(
+                f"productUpdate({', '.join(written)}) refused for "
+                f"{product_input.get('id')}: {user_errors}"
+            )
+
+        product = result.get("product")
+        if product is None:
+            # No userErrors and no product is not a documented shape; treat it as a failed write
+            # rather than assuming success on a payload we cannot read.
+            raise ShopifyWriteError(
+                f"productUpdate returned neither a product nor userErrors for "
+                f"{product_input.get('id')}."
+            )
+        return product
 
     async def iter_products(self, cursor: str | None = None):
         """Yield ``(products, end_cursor)`` one page at a time, resuming from ``cursor``."""

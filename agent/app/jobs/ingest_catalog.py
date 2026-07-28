@@ -23,7 +23,7 @@ from sqlalchemy.dialects.postgresql import insert
 from app.db import SessionLocal
 from app.models import IngestRun, IngestStatus, Product, Shop, ShopStatus
 from app.redis import release_ingest_lock
-from app.services.catalog import extract_gtin, normalize_visibility_state
+from app.services.catalog import normalize_visibility_state, product_row_from_node
 from app.services.shopify_admin import ShopifyAdminClient
 from app.services.token_provider import TokenProvider, TokenUnavailableError
 
@@ -47,21 +47,13 @@ async def _write_page(session, shop_id: int, nodes: list[dict[str, Any]]) -> int
 
     rows = []
     for node in nodes:
-        variants = (node.get("variants") or {}).get("nodes") or []
-        metafields = (node.get("metafields") or {}).get("nodes") or []
-        category = node.get("category") or {}
+        # Shared node→row mapping (services.catalog) — the Publisher re-reads through the same
+        # function, so its staleness hash is computed over exactly what ingest stored here.
         rows.append(
             {
+                **product_row_from_node(node),
                 "shop_id": shop_id,
-                "shopify_product_id": node["id"],
-                "title": node.get("title"),
-                "body": node.get("descriptionHtml"),
-                "variants_json": variants,
-                "gtin": extract_gtin(variants),
-                "metafields_json": metafields,
                 "visibility_state": _visibility_state(node),
-                "product_type": node.get("productType") or None,
-                "category": category.get("fullName"),
                 "updated_at": datetime.now(UTC),
             }
         )
