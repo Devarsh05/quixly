@@ -127,7 +127,10 @@ they **break the chain and force the merchant to reinstall**.
 
 ## Risk zones (extra care — explain before touching)
 - **Never publish to a merchant's Shopify store without an explicit approval gate.**
-  Publishing flows through `fixes.status = approved` only.
+  Publishing flows through `fixes.status = approved` only. The gate is `agent/app/api/fixes.py` +
+  `app/app/routes/app.fixes.tsx`; its invariants (server-side approvability, 409 on non-`proposed`,
+  404-not-403 ownership, one approved row per target) are in "Conventions" and are load-bearing for
+  the Publisher. Do not add a second writer of `fixes.status` from a merchant action.
 - **Never fabricate product attributes, specs, GTINs, or reviews.** Optimizer may only
   enrich/restructure from verified source data; every fix carries a before/after diff + source.
 - **Category assignment is a publish-class write.** Assigning a Standard-taxonomy category (the
@@ -258,6 +261,25 @@ they **break the chain and force the merchant to reinstall**.
     Copilot agentic channel reads. **This is the primary legibility channel**, not a fallback.
   - **taxonomy metafield fix** — **BLOCKED** on `read_metaobject_definitions` (above). Deferred.
   `shops.plan` stays NULL; its owner is the connect/ingest path, never a diagnostic (backlog).
+- **Approval gate (step 3) — the invariants the Publisher must not break.** `agent/app/api/fixes.py`
+  is the ONLY writer of `fixes.status` from a merchant decision. It makes **no Shopify calls** and
+  writes **exactly one column**; approval is a status transition (`proposed → approved | rejected`),
+  never a publish.
+  - **Approvability is enforced server-side, not hidden in the UI.** `APPROVABLE_TYPES` is exactly
+    `{description, category}`. A taxonomy `metafield` fix (blocked on `read_metaobject_definitions`)
+    and a `merchant_todo` (no `after_json`) are refused with **409**, and the shell renders them
+    with no approve control at all. The invariant is **no approvable path to a write that cannot
+    execute** — when Step 4 unblocks a fix type, widen `APPROVABLE_TYPES`, never the UI alone.
+  - **Non-`proposed` states 409; they are never a silent no-op.** Repeating the *same* decision is
+    idempotent, anything else conflicts. A silent success would hide exactly the double-submit and
+    stale-UI bugs the gate exists to catch.
+  - **Ownership is a join, and a mismatch is 404, not 403** — `fixes → products → shops`, so fix ids
+    cannot be probed for existence across shops. Never look a fix up by bare id.
+  - **At most ONE approved fix per `(product_id, target)`.** Approving marks the other `proposed` /
+    `approved` rows on that target `stale`, because the description composer **appends** — two
+    approved rows for one body would append the Details block twice.
+  - **A new run never touches `approved` / `rejected` rows from an earlier run.** Those are merchant
+    decisions; re-running the Optimizer must not silently drop consent.
 - **`products.visibility_state` has ONE normalizer** — `normalize_visibility_state` in
   `agent/app/services/catalog.py`, used by BOTH writers (the ingest job and the `products/update`
   webhook). Case-insensitive (GraphQL yields UPPERCASE, webhooks lowercase); maps
@@ -310,7 +332,7 @@ Only items confirmed by committed code or a session log are checked.
 - [x] Read-only report UI: embedded audit page + agent client `startScan` / `getReport`
 - [x] Gate F — live webhook verification: `products/update` (HMAC + DB write) & `app/uninstalled` (status flip); topic-dispatch fix `f0b97bc`; reinstall + re-ingest 20/20
 
-### Phase 3 — Fix — Optimizer complete; approval UI + Publisher remain
+### Phase 3 — Fix — Optimizer + approval gate complete; Publisher remains
 - [x] Product audit — per-product, per-class rubric; three-state spec model
       (structured/unstructured/absent); two channel-specific coverage numbers. Gate G, re-baked as
       Gate M when the family set grew 7→9 (added `coffee-product-form`, `decaffeination-method`)
@@ -326,7 +348,9 @@ Only items confirmed by committed code or a session log are checked.
       reality RESOLVED (Copilot active, 113 published); canonical GID map live-validated. Resolver
       contract **NOT confirmed** — blocked on `read_metaobject_definitions`
       (`docs/decisions/2c-write-target.md` L6/L7)
-- [ ] Preview/approve UI behind the mandatory approval gate (`fixes.status = approved`) — Step 3
+- [x] Preview/approve UI behind the mandatory approval gate (`fixes.status = approved`) — Step 3.
+      Agent `api/fixes.py` (run / list / approve / reject) + shell `app.fixes.tsx`. Reads `fixes`,
+      writes exactly one column (`fixes.status`); zero Shopify calls. Invariants in Conventions
 - [ ] Publisher (Admin API writes) — dev store only first, re-read + parse-check after publish —
       Step 4. Ships on **`category` + `description`, both proven writable**. The **taxonomy
       metafield** path is deferred — blocked on a third merchant consent plus an unproven
@@ -352,10 +376,11 @@ Only items confirmed by committed code or a session log are checked.
 - [ ] MCP server
 
 **Next action:** the Optimizer half of Phase 3 is complete, the false "absent" to-do blocker is
-closed (step 2e), and the scope grant + live diagnostic are done (step 4-preamble). **Step 3
-(approval UI) is unblocked** and is the next build. **Step 4 ships on `category` + `description`**;
-the taxonomy metafield path is deferred behind a spike + third consent (see backlog). Both remain
-**plan-first**, as the first code that writes to live merchant stores.
+closed (step 2e), the scope grant + live diagnostic are done (step 4-preamble), and the approval
+gate now exists (step 3) — so there is a supply of `fixes.status = approved` rows for a publisher to
+consume. **Step 4 (Publisher) is the next build, and ships on `category` + `description`, both
+proven writable**; the taxonomy metafield path is deferred behind a spike + third consent (see
+backlog). It stays **plan-first**, as the first code that writes to live merchant stores.
 
 ## Session Log
 
