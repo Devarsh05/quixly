@@ -654,6 +654,10 @@ Note on #3: "the body is unchanged" alone would NOT have proved reconciliation, 
 `after_json` is fixed at propose time, so a re-write would have produced the same bytes. The
 `updatedAt` timestamp is what proves no mutation was issued.
 
+Product 113 carried the L10 contract probes (bad GIDs, nonexistent product) and was **restored
+byte-identical** — body and category both re-read equal to the pre-probe baseline. The Colombia
+Huila and Kenya AA publishes were left in place as intended dev-store demo state.
+
 ## Still deferred, unchanged
 
 The **taxonomy metafield** path remains blocked on `read_metaobject_definitions` (L6). The

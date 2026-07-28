@@ -40,19 +40,28 @@ riskiest path.
    The only paths out of `approved` are "already landed" (no write) and "still equals `before_json`"
    (safe to write); a body matching neither is `stale`.
 
-## Two findings that changed the design
+## Three findings that came from failures, not reasoning
 
 **`base_source_hash` was not writer-stable.** `products` has two writers that store `variants_json`
 in different shapes — the GraphQL ingest job and the REST `products/update` webhook — and our own
 publish fires that webhook moments later. A live re-read could never have reproduced a stored
-digest, so the gate would have refused every write. Fixed with a projection both writers spell
-identically (`services.catalog.stable_source_hash`); `_build_source_fields` is untouched so
-grounding is unchanged. Detail: `2c-write-target.md` L11.
+digest, so the gate would have refused every write. **Found by the first live publish attempt being
+refused as `stale` on an untouched product**, not by reading the code. Fixed with a projection both
+writers spell identically (`services.catalog.stable_source_hash`); `_build_source_fields` is
+untouched so grounding is unchanged. Detail: `2c-write-target.md` L11.
 
 **A refused write arrives in two shapes.** A bad `TaxonomyCategory` GID comes back as a **top-level
 GraphQL error**, not `userErrors`; a nonexistent product comes back as **200 + `userErrors`**.
 Checking either one alone misses the other. Both now raise and both land on `publish_failed`.
 Detail: L10. This was found by a live test failing, not by reasoning.
+
+**Two of the Publisher's own tests were passing for the wrong reason.** They selected over the
+**whole `fixes` table** and were green only because that table happened to be empty. The live run
+populated it and both failed — the exact trap `test_fix_job.py` already documents in a comment.
+Neither was a Publisher bug: the tests were unscoped, and an empty table cannot distinguish a
+correct query from a query with no `WHERE`. Fixed by scoping each to its own product (`3b1a563`).
+**Lesson, now twice-observed in this repo: a query-over-everything assertion is unfalsifiable until
+the table has rows it should exclude — seed the exclusion, or the test proves nothing.**
 
 ## Schema
 

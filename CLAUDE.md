@@ -110,6 +110,15 @@ they **break the chain and force the merchant to reinstall**.
   `POST /internal/shops/:shop/admin-token`.
 - **All agent-side Admin API calls go through `TokenProvider`** (`agent/app/services/`).
   Never fetch or cache a token anywhere else.
+- **Writes use the same custody path as reads — the invariant is a single refresh
+  AUTHORITY, not a single *caller*.** The **agent** performs the Admin API write
+  (`graph/publisher.py` → `ShopifyAdminClient` → `TokenProvider`), on a short-lived token
+  minted by the app shell. A write is the same token as a read with a different verb: it
+  adds no token path, no new internal endpoint, and the agent still stores nothing. Do
+  **not** move the write into the shell — that either drags staleness gating, per-type
+  verification and status transitions into the thin layer, or turns the shell into a
+  GraphQL proxy re-implementing 401-retry and leaky-bucket handling: a second, untested
+  copy of the riskiest client code, on the riskiest path.
 - **`/internal/shops/:shop/admin-token` status codes are load-bearing.** The agent decides
   permanence from them, so they must not be loosened:
   - **404 = PERMANENT** → agent flags `reauth_required` and stops. Covers *both* "no session
@@ -264,10 +273,24 @@ they **break the chain and force the merchant to reinstall**.
 - **Publisher (step 4) — the invariants that keep a merchant safe.** `agent/app/graph/publisher.py`
   is the ONLY code that writes to a merchant's store; `POST .../fixes/publish` is the only route
   that reaches it, and it takes **no fix ids** — the work set is exactly the shop's `approved` rows.
-  - **A 200 is NOT a success.** `productUpdate` returns HTTP 200 with non-empty `userErrors` when it
-    refuses, and a clean write may still not land. Nothing reaches `verified` without a **separate
-    re-read**; the mutation's own return payload is never evidence. `published_at` is set only on
-    that confirmed re-read.
+  - **A 200 is NOT a success; the Publisher is RE-READ-VERIFIED.** `productUpdate` returns HTTP
+    200 with non-empty `userErrors` when it refuses, and a clean write may still not land.
+    Nothing reaches `verified` without a **separate re-read** of the live product; the mutation's
+    own return payload is never evidence. The re-read is per-type and specific — **description**:
+    the Details block is present *and* the merchant's body survives intact; **category**: live
+    `category.id` equals the GID written. A 200-but-wrong is **`publish_failed`, never
+    `published`**, and `published_at` is set **only** on the confirmed re-read.
+  - **Publish audit columns: one meaning per column.** `fixes.published_at` (TIMESTAMPTZ NULL) is
+    set **only** on a confirmed re-read — it is the "went live at" anchor Phase 4's Verifier
+    measures uplift against, so writing it anywhere else corrupts that measurement.
+    `fixes.publish_error` (TEXT NULL) is why a write did not land — which write, and what Shopify
+    returned — and is surfaced to the merchant. `fixes.reason` keeps pure grounding/to-do
+    semantics and **the Publisher never writes it**. `FixStatus.publish_failed` is code-only (no
+    enum in the DB, no migration). Migration `530075ef94b8` added the two columns.
+  - **Shopify echoes `descriptionHtml` byte-for-byte** (L9), so exact equality is the real
+    verification path and the re-read's structural fallback (merchant copy present + every
+    appended `<li>` parsed) is a **safety net, not the routine path**. If it ever fires, the
+    warning is a signal worth investigating, not expected noise.
   - **A refused write arrives in TWO shapes** (observed live, L10): a bad `TaxonomyCategory` GID is a
     **top-level GraphQL error** (`INVALID_PRODUCT_TAXONOMY_NODE_ID`), while a nonexistent product is
     **200 + `userErrors`**. Checking either alone misses the other. Any new write path must handle
@@ -277,10 +300,14 @@ they **break the chain and force the merchant to reinstall**.
     changed body and a category assigned over the merchant's own choice. Layer 2 is
     `base_source_hash` recomputed from the live read, catching drift in fields the fix *grounded on*
     but does not *write*.
-  - **Replay cannot double-append.** Only `approved` rows are work items, and **reconciliation runs
-    before the staleness gate**: a product already equal to `after_json` had its write land before a
-    crash, so it verifies with zero mutations. The rewind exists so a landed sibling does not stale
-    the fixes queued behind it. Never reorder these two steps.
+  - **Double-append is structurally impossible.** An `approved` fix has exactly **two** paths out:
+    live already equals `after_json` (the write landed before a crash → reconcile to `verified`,
+    **no mutation**), or live still equals `before_json` (safe to write). A body matching
+    **neither** is `stale`. This is why **reconciliation runs before the staleness gate** — the
+    rewind stops a landed sibling from staling the fixes queued behind it. Never reorder these two
+    steps. Proven live by the product's `updatedAt` **not moving** across a replay — *not* by body
+    equality, since `after_json` is fixed at propose time and a re-write would produce identical
+    bytes (identical bytes prove nothing).
   - **Invariant breaches abort the run, they are not skipped.** An approved `metafield`/
     `merchant_todo` row, or two approved rows on one `(product_id, target)`, mean the approval gate
     or its supersede failed — write nothing and fail loudly.

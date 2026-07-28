@@ -69,9 +69,30 @@ the phase by which it should be revisited.
   *nothing at all* on all 18 products, 29 families still recover and false claims stay **0**.
   _Raised: 2026-07-27 (step 2d acceptance, run 839); resolved: 2026-07-27._
 
-## Taxonomy write path (Step 4)
+- **The `mentioned_no_value` to-do tier is unit-tested but never live-exercised.** Step 2e's third
+  truthful tier ("mentioned, but no value readable") is asserted in
+  `test_optimizer_negative_grounding.py` against stubbed extraction; no *real* LLM run has yet
+  produced one and had a merchant read it. It is the tier most exposed to phrasing quality, since it
+  is the only to-do that quotes source text back. Confirm it appears — and reads sensibly — in a real
+  run before Phase 5 puts to-dos in front of a paying merchant.
+  _Raised: 2026-07-28 (Phase 3 close-out; carried forward, not a Phase-3 blocker)._
 
-- **DEFERRED — blocked on a scope AND an unproven surface.** The canonical
+## Agent run identity
+
+- **`agent_runs.panel_id` is NOT NULL and there is no run-kind discriminator.** `AgentRun`
+  (`agent/app/models/agent_run.py`) requires a `query_panels` FK and carries no `kind`/`type`
+  column, so every run looks like a scan. A fix run, and now a publish run, have no query panel of
+  their own and must borrow one — the FK asserts a relationship that isn't real for them. Two
+  consequences: run-scoped queries cannot filter by kind without joining out to what the run
+  *produced*, and `run_id`-scoped reporting silently mixes scan runs with fix/publish runs. Fix is a
+  small migration (`panel_id` nullable + a `kind` column with a backfill defaulting existing rows to
+  `scan`) — cheapest **before** Phase 4 adds verification runs as a third kind and the ambiguity
+  compounds. _Raised: 2026-07-28 (Phase 3 close-out; carried forward, not a Phase-3 blocker)._
+
+## Taxonomy write path (Step 4) — THE ONLY REMAINING PHASE-3 WORK ITEM
+
+- **DEFERRED — blocked on a scope AND an unproven surface. Phase 3 is otherwise COMPLETE**
+  (Optimizer → approval gate → Publisher, live-verified on the dev store 2026-07-28). The canonical
   value→`TaxonomyValue`-GID half is **proven** (`agent/app/services/taxonomy_map.py` validates
   against the live `taxonomy` root). The canonical→**per-shop-metaobject-entry-GID** hop is
   **untested**, because the metaobject *definition* surface is invisible without
@@ -83,11 +104,19 @@ the phase by which it should be revisited.
   canonical→entry GID → write it → re-read confirms. Only if that spike passes does the taxonomy
   write path become buildable. **If the surface stays empty with both scopes, taxonomy attributes
   may not be app-writable on this tier** — a real possible outcome, and cheap to learn via probe.
-  Until then **Step 4 ships on `category` + `description` (both proven)**.
-  The Optimizer may keep **proposing** taxonomy fixes — they are grounded, correct, and publishable
-  the moment the path unblocks — **but the approval UI must not offer an approve that leads to a
-  write that cannot execute.** Raw evidence: `docs/decisions/2c-write-target.md` → L6.
-  _Raised: 2026-07-27 (Phase 3 step-4-preamble, L6)._
+  **Step 4 SHIPPED on `category` + `description` (both proven live, L9–L12)** and the deferral is
+  now enforced in code at three layers, not by discipline: the Optimizer keeps **proposing**
+  taxonomy fixes (grounded, correct, and publishable the moment the path unblocks);
+  `APPROVABLE_TYPES` refuses to approve one (**409**) and the shell renders no approve control; and
+  the Publisher **aborts the run** if an approved `metafield` row is ever present — its existence
+  would mean the approval gate was bypassed, so it is a loud failure, never a silent skip.
+  **When this unblocks**, the order is: widen `APPROVABLE_TYPES` → add the publish path with the
+  same two-layer staleness gate and separate re-read → *then* the UI. Never the UI alone.
+  **Optional, not a Phase-4 blocker:** Phase 4 verifies uplift through the `description` channel,
+  which Copilot reads and which needs no further scope.
+  Raw evidence: `docs/decisions/2c-write-target.md` → L6 (blocker), L12 (what shipped instead).
+  _Raised: 2026-07-27 (Phase 3 step-4-preamble, L6); scoped to sole-remainder 2026-07-28
+  (Step 4 close-out)._
 
 ## Shop record
 
