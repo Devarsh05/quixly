@@ -69,6 +69,10 @@ export type FixView = {
   citations: Citation[];
   approvable: boolean;
   block_reason: string | null;
+  /** Why a publish did not land — a stale refusal or a failed write. Shown verbatim. */
+  publish_error: string | null;
+  /** Set only on a confirmed post-write re-read, never on the API's 200. */
+  published_at: string | null;
   added_lines: AddedLine[];
   category_from: string | null;
   category_to: string | null;
@@ -83,12 +87,18 @@ export type ProductFixes = {
   approvable: FixView[];
   not_publishable: FixView[];
   needs_input: FixView[];
+  /** Approved, awaiting publish — exactly what the Publisher would write, no more. */
+  ready: FixView[];
+  /** What a publish run actually did: verified, failed, or refused as stale. */
+  settled: FixView[];
 };
 
 export type FixList = {
   run_id: number | null;
   status: "running" | "completed" | "failed" | null;
   products: ProductFixes[];
+  publish_run_id: number | null;
+  publish_status: "running" | "completed" | "failed" | null;
 };
 
 export type FixRunStart = { run_id: number; status: string };
@@ -207,8 +217,16 @@ export function startFixRun(shopDomain: string): Promise<FixRunStart> {
  * A shop that has never proposed fixes returns `run_id: null` with an empty list — that is a
  * normal empty state, NOT an error, and is distinct from the agent being unreachable.
  */
-export async function getFixes(shopDomain: string, runId?: number): Promise<FixList> {
-  const query = runId != null ? `?run_id=${runId}` : "";
+export async function getFixes(
+  shopDomain: string,
+  runId?: number,
+  publishRunId?: number,
+): Promise<FixList> {
+  const params = new URLSearchParams();
+  if (runId != null) params.set("run_id", String(runId));
+  if (publishRunId != null) params.set("publish_run_id", String(publishRunId));
+  const query = params.size > 0 ? `?${params}` : "";
+
   const response = await fetch(
     agentUrl(`/shops/by-domain/${encodeURIComponent(shopDomain)}/fixes${query}`),
     { headers: internalHeaders() },
@@ -218,6 +236,21 @@ export async function getFixes(shopDomain: string, runId?: number): Promise<FixL
     throw new Error(`Agent fixes returned ${response.status}`);
   }
   return (await response.json()) as FixList;
+}
+
+/**
+ * THE PUBLISH TRIGGER — the only call in this app that leads to a write on the merchant's store.
+ *
+ * Takes no fix ids: the work set is exactly the shop's `approved` rows, so nothing can be
+ * published that the merchant did not individually approve in the gate. Async agent-side
+ * (202 + run_id), polled like a scan. A shop with nothing approved gets a 409, so "publish"
+ * never silently does nothing.
+ */
+export function publishFixes(shopDomain: string): Promise<FixRunStart> {
+  return post<FixRunStart>(
+    `/shops/by-domain/${encodeURIComponent(shopDomain)}/fixes/publish`,
+    {},
+  );
 }
 
 /**

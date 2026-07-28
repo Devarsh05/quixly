@@ -266,7 +266,13 @@ async def test_list_unknown_shop_404_but_a_shop_with_no_fixes_is_empty(client, d
     await _make_shop(db, OTHER_SHOP)
     response = await client.get(f"/shops/by-domain/{OTHER_SHOP}/fixes", headers=HEADERS)
     assert response.status_code == 200
-    assert response.json() == {"run_id": None, "status": None, "products": []}
+    assert response.json() == {
+        "run_id": None,
+        "status": None,
+        "products": [],
+        "publish_run_id": None,
+        "publish_status": None,
+    }
 
 
 # --- run trigger -----------------------------------------------------------------------------
@@ -423,3 +429,158 @@ async def test_a_shops_list_never_leaks_another_shops_fixes(client, db, seeded):
 
     body = (await client.get(f"/shops/by-domain/{SHOP}/fixes", headers=HEADERS)).json()
     assert [p["product_id"] for p in body["products"]] == [seeded["product"].id]
+
+
+# --- publish (step 4) ------------------------------------------------------------------------
+@pytest.fixture
+def publish_enqueued(monkeypatch) -> list[int]:
+    calls: list[int] = []
+
+    async def fake_enqueue(run_id: int) -> None:
+        calls.append(run_id)
+
+    monkeypatch.setattr(fixes_api, "_enqueue_publish", fake_enqueue)
+    return calls
+
+
+async def test_publish_requires_the_internal_key(client, seeded):
+    assert (await client.post(f"/shops/by-domain/{SHOP}/fixes/publish")).status_code == 401
+
+
+async def test_publish_with_nothing_approved_409s_rather_than_running_an_empty_job(
+    client, seeded, publish_enqueued
+):
+    """"Publish" must never silently do nothing — an empty run reads as success."""
+    response = await client.post(f"/shops/by-domain/{SHOP}/fixes/publish", headers=HEADERS)
+
+    assert response.status_code == 409
+    assert publish_enqueued == []
+
+
+async def test_publish_enqueues_a_run_for_the_shops_approved_rows(
+    client, db, seeded, publish_enqueued
+):
+    fix = (await _fixes_of(db, seeded["product"].id, FixType.description))[0]
+    await client.post(f"/shops/by-domain/{SHOP}/fixes/{fix.id}/approve", headers=HEADERS)
+
+    response = await client.post(f"/shops/by-domain/{SHOP}/fixes/publish", headers=HEADERS)
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == AgentRunStatus.running
+    assert publish_enqueued == [body["run_id"]]
+
+    # The route itself writes NO fix row — it only enqueues. The gate stays the only status writer
+    # from a merchant decision.
+    await db.refresh(fix)
+    assert fix.status == FixStatus.approved
+
+
+async def test_publish_ignores_another_shops_approved_rows(
+    client, db, seeded, publish_enqueued
+):
+    other = await _make_shop(db, OTHER_SHOP)
+    other_run = await _make_run(db, other.id)
+    other_product = await _make_product(db, other.id, title="Someone else's coffee")
+    db.add(_fix(other_product.id, other_run.id, FixType.description, "body_html",
+                status=FixStatus.approved, after_json={"body_html": BODY_AFTER}))
+    await db.commit()
+
+    # SHOP has nothing approved of its own, so it must still 409 despite the other shop's row.
+    response = await client.post(f"/shops/by-domain/{SHOP}/fixes/publish", headers=HEADERS)
+    assert response.status_code == 409
+    assert publish_enqueued == []
+
+
+# --- the widened list ------------------------------------------------------------------------
+async def test_an_approved_fix_moves_to_ready_so_it_is_never_invisible(client, db, seeded):
+    """Approving must not make a fix disappear: ``ready`` is exactly the Publisher's work set."""
+    fix = (await _fixes_of(db, seeded["product"].id, FixType.description))[0]
+    await client.post(f"/shops/by-domain/{SHOP}/fixes/{fix.id}/approve", headers=HEADERS)
+
+    product = (await client.get(f"/shops/by-domain/{SHOP}/fixes", headers=HEADERS)).json()[
+        "products"
+    ][0]
+
+    assert [f["id"] for f in product["ready"]] == [fix.id]
+    assert fix.id not in [f["id"] for f in product["approvable"]]
+
+
+async def test_approved_rows_from_an_EARLIER_run_are_still_listed(client, db, seeded):
+    """The Publisher publishes every approved row for the shop, so the list must show them all.
+
+    Run-scoping this half would show the merchant fewer rows than we would actually write.
+    """
+    fix = (await _fixes_of(db, seeded["product"].id, FixType.description))[0]
+    fix.status = FixStatus.approved
+    later_run = await _make_run(db, seeded["shop"].id)
+    db.add(_fix(seeded["product"].id, later_run.id, FixType.category, "category",
+                after_json={"category": "gid://shopify/TaxonomyCategory/fb-1-3-1"}))
+    await db.commit()
+
+    body = (await client.get(f"/shops/by-domain/{SHOP}/fixes", headers=HEADERS)).json()
+
+    assert body["run_id"] == later_run.id  # the newest run scopes the PROPOSED rows
+    assert [f["id"] for f in body["products"][0]["ready"]] == [fix.id]  # ...but not the approved
+
+
+async def test_publish_outcomes_are_surfaced_with_their_cause(client, db, seeded):
+    fix = (await _fixes_of(db, seeded["product"].id, FixType.description))[0]
+    fix.status = FixStatus.publish_failed
+    fix.publish_error = "Shopify reports the appended line is missing"
+    await db.commit()
+
+    product = (await client.get(f"/shops/by-domain/{SHOP}/fixes", headers=HEADERS)).json()[
+        "products"
+    ][0]
+
+    settled = product["settled"][0]
+    assert settled["id"] == fix.id
+    assert settled["publish_error"] == "Shopify reports the appended line is missing"
+    assert settled["published_at"] is None
+
+
+async def test_a_supersede_stale_row_stays_hidden_but_a_publisher_refusal_shows(client, db, seeded):
+    """``stale`` is overloaded. Only the Publisher leaves a cause, and only those are shown."""
+    description, category = (
+        (await _fixes_of(db, seeded["product"].id, FixType.description))[0],
+        (await _fixes_of(db, seeded["product"].id, FixType.category))[0],
+    )
+    description.status = FixStatus.stale  # Step 3 supersede — no cause recorded
+    category.status = FixStatus.stale
+    category.publish_error = "the product category changed after this fix was approved"
+    await db.commit()
+
+    product = (await client.get(f"/shops/by-domain/{SHOP}/fixes", headers=HEADERS)).json()[
+        "products"
+    ][0]
+
+    assert [f["id"] for f in product["settled"]] == [category.id]
+
+
+async def test_publish_run_status_is_echoed_back_for_polling(client, db, seeded):
+    publish_run = await _make_run(db, seeded["shop"].id)
+    publish_run.status = AgentRunStatus.running
+    await db.commit()
+
+    body = (
+        await client.get(
+            f"/shops/by-domain/{SHOP}/fixes?publish_run_id={publish_run.id}", headers=HEADERS
+        )
+    ).json()
+
+    assert body["publish_run_id"] == publish_run.id
+    assert body["publish_status"] == AgentRunStatus.running
+
+
+async def test_another_shops_publish_run_is_not_reported(client, db, seeded):
+    other = await _make_shop(db, OTHER_SHOP)
+    other_run = await _make_run(db, other.id)
+
+    body = (
+        await client.get(
+            f"/shops/by-domain/{SHOP}/fixes?publish_run_id={other_run.id}", headers=HEADERS
+        )
+    ).json()
+
+    assert body["publish_status"] is None
