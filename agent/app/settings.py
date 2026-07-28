@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     # never an incidental one.
     publish_allowed_shops: str = "quixly-ljymkoyb.myshopify.com"
 
+    # Verifier (Phase 4). How long after the last publish an engine is given to re-crawl before a
+    # post-scan counts as a settled measurement. 168h = 7 days, matching the weekly-scan cadence
+    # and honest about the fact that no engine publishes a re-crawl SLA. A verification requested
+    # inside the window is refused (409) unless ``force`` is passed, and a forced one is persisted
+    # with ``settle_satisfied = false`` — labelled, never silently mixed in with settled results.
+    verify_settle_hours: float = 168.0
+
     # AI shopping-engine API keys (optional until Phase 2 wiring; no secret defaults).
     # SecretStr so the key can never surface in a repr, log line, or traceback.
     perplexity_api_key: SecretStr = Field(default=SecretStr(""))

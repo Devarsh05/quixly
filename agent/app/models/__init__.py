@@ -10,6 +10,7 @@ from app.models.product import Product
 from app.models.query_panel import QueryPanel
 from app.models.share_of_model import ShareOfModel
 from app.models.shop import Shop, ShopStatus
+from app.models.verification import Verification
 
 __all__ = [
     "AgentRun",
@@ -28,4 +29,5 @@ __all__ = [
     "ShareOfModel",
     "Shop",
     "ShopStatus",
+    "Verification",
 ]

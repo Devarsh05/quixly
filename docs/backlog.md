@@ -89,6 +89,27 @@ the phase by which it should be revisited.
   `scan`) — cheapest **before** Phase 4 adds verification runs as a third kind and the ambiguity
   compounds. _Raised: 2026-07-28 (Phase 3 close-out; carried forward, not a Phase-3 blocker)._
 
+## Verifier / panel identity
+
+- **`query_panels.fingerprint` does not cover `template_id` or `attribute`.**
+  `interrogator._fingerprint` hashes `category` + the ordered `(intent_category, text)` pairs only,
+  so renaming a template id or changing the attribute token that filled it produces a *different
+  panel with an identical fingerprint* — and `upsert_panel` reuses the existing row rather than
+  creating a new one, silently keeping the old `queries_json`. Harmless today: only `text` is ever
+  sent to an engine, and the Verifier's fingerprint recheck compares like for like. **Deliberately
+  NOT fixed now** — widening the hash changes the coffee panel's fingerprint, which forks a new
+  `query_panels` row and orphans runs 75/137, the only pre-publish baselines that exist. Revisit
+  when a panel-versioning migration is worth it (e.g. when a second vertical lands), and migrate
+  the existing rows rather than letting them re-fork.
+  _Raised: 2026-07-28 (Phase 4 step 1)._
+
+- **`agent_runs` still has no run-kind discriminator, and Phase 4 did not add one.** Deliberate:
+  a verification run genuinely IS a scan run (it writes `engine_runs` + `share_of_model`), so a
+  `kind` column would have been redundant for it. Baseline selection instead keys on
+  `EXISTS (share_of_model WHERE run_id = …)`, which is exact. The underlying entry below (fix and
+  publish runs borrowing a panel they don't have) is unchanged and still worth doing.
+  _Raised: 2026-07-28 (Phase 4 step 1)._
+
 ## Taxonomy write path (Step 4) — THE ONLY REMAINING PHASE-3 WORK ITEM
 
 - **DEFERRED — blocked on a scope AND an unproven surface. Phase 3 is otherwise COMPLETE**

@@ -322,6 +322,55 @@ they **break the chain and force the merchant to reinstall**.
   excluded (assigning one is itself a fix). **`_build_source_fields` is a different thing** — it
   feeds extraction/grounding and must not be conflated with the hash. Generalises: any cross-writer
   comparison goes through a normalised projection. (Observed, not hypothetical — see L11.)
+- **Verifier (Phase 4 step 1) — the measurement core, and why its grain differs from PRD §8.**
+  `agent/app/graph/verifier.py` computes a per-engine share-of-model delta between a pre-publish
+  baseline scan and a post-publish scan. It is **orchestration over the Phase 2 nodes**, not a
+  second pipeline: `jobs/verify.py` calls the same `jobs.scan.run_scan_pipeline`, so **a
+  verification run IS a scan run** — it writes `engine_runs` + `share_of_model` under its own
+  `run_id` and the report route reads it with no special-casing.
+  - **PRD §8's `fix_id` grain is SUPERSEDED. The grain is `(run_id, engine)`.** Pre/post rates are
+    shop/engine-level quantities over a fixed panel; hanging them off a `fix_id` would manufacture
+    N causal claims from one correlational observation — the messy-attribution trap PRD §13 names.
+    Per-fix survives only as `measured_fixes_json`, an immutable JSONB manifest (GIN-indexed):
+    **annotation, not attribution**. Never phrase a delta as "uplift caused by" a fix.
+  - **NO-DATA IS DECIDED BY `total_queries`, NEVER BY `our_rate`.** `_side_rates` treats a missing
+    row, `total_queries IS NULL`, or `total_queries = 0` as no data and NULLs the rate *regardless
+    of what `our_rate` literally holds*. The aggregator does write NULL today, but that invariant
+    lives in one branch of one function, both columns are nullable, and no CHECK ties them
+    together. Reading a literal `0.0` over 0 queries would compute `0.0 - pre_rate` and show the
+    merchant a **fabricated regression** for what was only a flaky engine. NULL on either side
+    propagates to `delta = NULL`; never `coalesce(…, 0)`.
+  - **Panel pinning: BIND, never rebuild.** The verify route creates the post run with the
+    **baseline's `panel_id`** and never calls `build_query_panel()` — that is what `start_scan`
+    does, and after any Interrogator edit it would bind the post scan to a *new* panel row and
+    confound the delta with nothing raised. The node re-asserts the binding AND recomputes the
+    panel's content fingerprint (catching an out-of-band edit). Either mismatch aborts.
+    **Do not widen `interrogator._fingerprint`** to cover `template_id`/`attribute`: it would
+    change the coffee panel's hash and orphan the only baselines that exist (backlog).
+  - **The measured set is SNAPSHOTTED ONCE, at the route, and never re-resolved.**
+    `services/baselines.resolve_measured_set` runs before any engine spend; the list is threaded
+    through the queue and consumed verbatim by the job. The settle gate, `published_at_max` and
+    the persisted manifest all read that one snapshot. Re-querying at aggregation time would let a
+    concurrent publish make the 409 the merchant already got disagree with the row that lands —
+    both internally consistent, silently describing different windows.
+  - **The measured set is `status = verified`, never `published`.** `published` is the
+    intermediate state between the Shopify write and the confirming re-read — it may not be live.
+  - **A baseline is identified by what it PRODUCED, not by status or panel.** Every run on the dev
+    store is `completed` on the same `panel_id` (fix/publish runs borrow one), and one is
+    `completed` with zero aggregates. Selection requires `EXISTS (share_of_model WHERE run_id …)`.
+    The baseline anchor is **`max(published_at)`, not `min`** — anchoring on the earliest publish
+    makes a shop that published once long ago permanently unverifiable.
+  - **Settle window: `VERIFY_SETTLE_HOURS` (default 168h).** Inside it the route 409s unless
+    `force=true`, which is a **label, not a bypass**: the row persists real `settle_hours` and
+    `settle_satisfied = false`, so an early measurement can never be read back as a settled one.
+  - **`fixes.published_at` is measurement-sacred — the Verifier READS it and writes nothing.**
+    The verify path SELECTs `fixes` in exactly one place and no module in it imports `Fix` for
+    writing. The Publisher stays its only writer.
+  - **Shopify-free by exclusion.** The measurement core makes no Admin API call and takes no
+    token. It reads **no publication state at all** — so if a later step wants agentic-channel
+    readback it must use `product.resourcePublications` and must NOT gate on
+    `resourcePublicationsCount` (see the channel-discovery convention above; this bites the
+    Verifier hardest). Browserbase ground-truth simulation is a separate Phase 4 item.
 - **One node→row mapping.** `services.catalog.product_row_from_node` is shared by the ingest job and
   the Publisher's re-read, so the Publisher hashes exactly what ingest stored. Don't add a second.
 - **Approval gate (step 3) — the invariants the Publisher must not break.** `agent/app/api/fixes.py`
@@ -423,7 +472,14 @@ Only items confirmed by committed code or a session log are checked.
       confirmed; a replay left Shopify's `updatedAt` untouched; a product edited after approval was
       refused as `stale`. Invariants in Conventions; evidence `2c-write-target.md` L9–L12
 
-### Phase 4 — Verify — not started
+### Phase 4 — Verify — in progress
+- [x] **Verifier measurement core — Step 1.** `graph/verifier.py` + `services/baselines.py` +
+      `jobs/verify.py` + `POST .../verify` / `GET .../verification`. Re-runs the pinned panel after
+      a publish and computes a per-engine share-of-model delta against a pre-publish baseline,
+      anchored to `fixes.published_at`. Reuses the Phase 2 nodes via the extracted
+      `jobs.scan.run_scan_pipeline` — a verification run IS a scan run. Migration `2bf30ca663a2`
+      (`verifications`, grain `(run_id, engine)`; PRD §8's `fix_id` grain superseded). Invariants in
+      Conventions. **Not yet run live** — dev-store acceptance is the next step
 - [ ] Verifier loop. **A first-party channel EXISTS — uplift verification is NOT forced onto the
       engine panel alone** (2026-07-27, reversing the earlier UNKNOWN): the dev store carries an
       ACTIVE Microsoft Copilot agentic publication with product 113 published to it, so a
@@ -449,12 +505,19 @@ Publisher writes to a live store and verifies by re-reading (steps 2b–4, all l
   merchant consent) plus proof the metaobject entry surface populates — see `docs/backlog.md`;
 - `PUBLISH_ALLOWED_SHOPS` still lists only the dev store, by design.
 
-**Phase 4 (Verify) is the next build.** It has what it needs: a proven-writable legibility channel
-(`description`), a live agentic publication to read back (Microsoft Copilot on the dev store), and
-now `fixes.published_at` as the "went live at" timestamp to measure uplift against. Read channel
-membership via `product.resourcePublications` and **never** by enumerating `publications` or gating
-on a count field (see Conventions). Phase 0's Railway deploy is still outstanding and is required
-before Phase 5.
+**Phase 4 Step 1 (Verifier measurement core) is built and green locally — but NOT yet run live.**
+The immediate next action is the **dev-store acceptance run**: baseline is run **137**
+(2026-07-21, `our_rate` 0.0, 24 queries, panel 316); the measured set is fixes **9702**
+(`description`, Colombia Huila) and **9710** (`category`, Kenya AA), published 2026-07-28
+14:51:27Z / 14:52:09Z. The 168h settle window is not met until **2026-08-04**, so the run needs
+`force=true` and must land `settle_satisfied = false` — confirming that labelling is itself part
+of the acceptance. Then verify by SQL that `pre_rate` matches run 137's persisted row, the manifest
+names exactly those two fixes, and **`fixes.published_at` is unchanged on both**.
+
+After that: the uplift chart, scheduled weekly scans (which also keep the refresh chain warm), and
+Browserbase simulation. Read channel membership via `product.resourcePublications` and **never** by
+enumerating `publications` or gating on a count field (see Conventions). Phase 0's Railway deploy is
+still outstanding and is required before Phase 5.
 
 ## Session Log
 
