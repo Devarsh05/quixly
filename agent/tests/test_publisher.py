@@ -170,7 +170,14 @@ async def test_description_write_is_verified_by_a_fresh_reread(db):
     # from the mutation's own return payload would prove nothing.
     assert client.reads == 2
 
-    fix = (await db.execute(Fix.__table__.select())).mappings().one()
+    # SCOPED to this test's product. The ``db`` fixture rolls back what the test writes but
+    # does NOT hide rows already committed in the dev database — an unscoped select reads
+    # the real catalog's fixes and the assertion becomes meaningless.
+    fix = (
+        await db.execute(
+            Fix.__table__.select().where(Fix.__table__.c.product_id == product.id)
+        )
+    ).mappings().one()
     assert fix["status"] == FixStatus.verified
     assert fix["published_at"] is not None
     assert fix["publish_error"] is None
@@ -188,7 +195,14 @@ async def test_category_write_lands_the_gid_and_refreshes_our_copy(db):
 
     assert client.mutations == [{"id": PRODUCT_GID, "category": CATEGORY_GID}]
 
-    fix = (await db.execute(Fix.__table__.select())).mappings().one()
+    # SCOPED to this test's product. The ``db`` fixture rolls back what the test writes but
+    # does NOT hide rows already committed in the dev database — an unscoped select reads
+    # the real catalog's fixes and the assertion becomes meaningless.
+    fix = (
+        await db.execute(
+            Fix.__table__.select().where(Fix.__table__.c.product_id == product.id)
+        )
+    ).mappings().one()
     assert fix["status"] == FixStatus.verified
     # Our stored copy is refreshed from the verifying read, so the next audit sees reality.
     await db.refresh(product)

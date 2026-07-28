@@ -253,14 +253,50 @@ they **break the chain and force the merchant to reinstall**.
   (including Copilot)** while `resourcePublicationsCount` reports **3** — the count omits the
   agentic publication that the list itself returns. This matters most for **Phase 4's Verifier**.
   Evidence: L7.
-- **Proven write paths for the Publisher (Step 4) — build on these NOW.**
+- **Proven write paths for the Publisher (Step 4) — SHIPPED and live-verified (2026-07-28).**
   - **`category` fix** — a scalar `TaxonomyCategory` GID via `productUpdate`. **Proven writable**
-    (L1); involves no metaobject, so it is *not* blocked. Still approval-gated as a publish-class
-    write.
+    (L1, re-confirmed live L12); involves no metaobject, so it is *not* blocked. Still
+    approval-gated as a publish-class write.
   - **`description` fix** — reaches all 9 families, needs **no extra scope**, and is the field the
     Copilot agentic channel reads. **This is the primary legibility channel**, not a fallback.
   - **taxonomy metafield fix** — **BLOCKED** on `read_metaobject_definitions` (above). Deferred.
   `shops.plan` stays NULL; its owner is the connect/ingest path, never a diagnostic (backlog).
+- **Publisher (step 4) — the invariants that keep a merchant safe.** `agent/app/graph/publisher.py`
+  is the ONLY code that writes to a merchant's store; `POST .../fixes/publish` is the only route
+  that reaches it, and it takes **no fix ids** — the work set is exactly the shop's `approved` rows.
+  - **A 200 is NOT a success.** `productUpdate` returns HTTP 200 with non-empty `userErrors` when it
+    refuses, and a clean write may still not land. Nothing reaches `verified` without a **separate
+    re-read**; the mutation's own return payload is never evidence. `published_at` is set only on
+    that confirmed re-read.
+  - **A refused write arrives in TWO shapes** (observed live, L10): a bad `TaxonomyCategory` GID is a
+    **top-level GraphQL error** (`INVALID_PRODUCT_TAXONOMY_NODE_ID`), while a nonexistent product is
+    **200 + `userErrors`**. Checking either alone misses the other. Any new write path must handle
+    both; both must raise.
+  - **Staleness is two hard layers, both before any write.** Layer 1 is exact per-fix `before_json`
+    equality (live `descriptionHtml` / live `category.id`) — this is what stops an append onto a
+    changed body and a category assigned over the merchant's own choice. Layer 2 is
+    `base_source_hash` recomputed from the live read, catching drift in fields the fix *grounded on*
+    but does not *write*.
+  - **Replay cannot double-append.** Only `approved` rows are work items, and **reconciliation runs
+    before the staleness gate**: a product already equal to `after_json` had its write land before a
+    crash, so it verifies with zero mutations. The rewind exists so a landed sibling does not stale
+    the fixes queued behind it. Never reorder these two steps.
+  - **Invariant breaches abort the run, they are not skipped.** An approved `metafield`/
+    `merchant_todo` row, or two approved rows on one `(product_id, target)`, mean the approval gate
+    or its supersede failed — write nothing and fail loudly.
+  - **Staged rollout is in code:** `PUBLISH_ALLOWED_SHOPS` defaults to the dev store alone and the
+    job refuses anything else before reading. Widening it is a deliberate commit.
+- **`base_source_hash` is a WRITER-STABLE projection, never a raw column hash.**
+  `services.catalog.stable_source_hash` is the single definition. `products` has two writers that
+  store `variants_json` in different shapes — the GraphQL ingest job and the REST `products/update`
+  webhook — and our own publish fires that webhook moments later, so hashing the raw JSONB made the
+  digest depend on which writer touched the row last and the staleness gate would have refused every
+  write. The projection keeps only what both writers spell identically. `category` is deliberately
+  excluded (assigning one is itself a fix). **`_build_source_fields` is a different thing** — it
+  feeds extraction/grounding and must not be conflated with the hash. Generalises: any cross-writer
+  comparison goes through a normalised projection. (Observed, not hypothetical — see L11.)
+- **One node→row mapping.** `services.catalog.product_row_from_node` is shared by the ingest job and
+  the Publisher's re-read, so the Publisher hashes exactly what ingest stored. Don't add a second.
 - **Approval gate (step 3) — the invariants the Publisher must not break.** `agent/app/api/fixes.py`
   is the ONLY writer of `fixes.status` from a merchant decision. It makes **no Shopify calls** and
   writes **exactly one column**; approval is a status transition (`proposed → approved | rejected`),
@@ -332,7 +368,7 @@ Only items confirmed by committed code or a session log are checked.
 - [x] Read-only report UI: embedded audit page + agent client `startScan` / `getReport`
 - [x] Gate F — live webhook verification: `products/update` (HMAC + DB write) & `app/uninstalled` (status flip); topic-dispatch fix `f0b97bc`; reinstall + re-ingest 20/20
 
-### Phase 3 — Fix — Optimizer + approval gate complete; Publisher remains
+### Phase 3 — Fix — complete (taxonomy metafield path deferred)
 - [x] Product audit — per-product, per-class rubric; three-state spec model
       (structured/unstructured/absent); two channel-specific coverage numbers. Gate G, re-baked as
       Gate M when the family set grew 7→9 (added `coffee-product-form`, `decaffeination-method`)
@@ -351,10 +387,14 @@ Only items confirmed by committed code or a session log are checked.
 - [x] Preview/approve UI behind the mandatory approval gate (`fixes.status = approved`) — Step 3.
       Agent `api/fixes.py` (run / list / approve / reject) + shell `app.fixes.tsx`. Reads `fixes`,
       writes exactly one column (`fixes.status`); zero Shopify calls. Invariants in Conventions
-- [ ] Publisher (Admin API writes) — dev store only first, re-read + parse-check after publish —
-      Step 4. Ships on **`category` + `description`, both proven writable**. The **taxonomy
-      metafield** path is deferred — blocked on a third merchant consent plus an unproven
-      metaobject surface (see backlog)
+- [x] Publisher (Admin API writes) — Step 4, **live-verified on the dev store 2026-07-28**.
+      `graph/publisher.py` + `jobs/publish.py` + `POST .../fixes/publish`. Ships on **`category` +
+      `description`**; taxonomy metafield still deferred (an approved one **aborts** the run).
+      Two-layer staleness gate, separate-re-read verification, reconciliation-before-staleness so a
+      replay cannot double-append, `PUBLISH_ALLOWED_SHOPS` rollout guard. Migration `530075ef94b8`
+      (`publish_error`, `published_at`). Live: description + category both landed and re-read
+      confirmed; a replay left Shopify's `updatedAt` untouched; a product edited after approval was
+      refused as `stale`. Invariants in Conventions; evidence `2c-write-target.md` L9–L12
 
 ### Phase 4 — Verify — not started
 - [ ] Verifier loop. **A first-party channel EXISTS — uplift verification is NOT forced onto the
@@ -375,12 +415,19 @@ Only items confirmed by committed code or a session log are checked.
 - [ ] App Store submission (incl. compliance webhooks `customers/data_request`/`redact`, `shop/redact`)
 - [ ] MCP server
 
-**Next action:** the Optimizer half of Phase 3 is complete, the false "absent" to-do blocker is
-closed (step 2e), the scope grant + live diagnostic are done (step 4-preamble), and the approval
-gate now exists (step 3) — so there is a supply of `fixes.status = approved` rows for a publisher to
-consume. **Step 4 (Publisher) is the next build, and ships on `category` + `description`, both
-proven writable**; the taxonomy metafield path is deferred behind a spike + third consent (see
-backlog). It stays **plan-first**, as the first code that writes to live merchant stores.
+**Next action:** Phase 3 is complete end-to-end — the Optimizer proposes, the gate approves, and the
+Publisher writes to a live store and verifies by re-reading (steps 2b–4, all live-verified on
+`quixly-ljymkoyb`). Two things carry forward rather than being finished:
+- the **taxonomy metafield** write path stays deferred behind `read_metaobject_definitions` (a third
+  merchant consent) plus proof the metaobject entry surface populates — see `docs/backlog.md`;
+- `PUBLISH_ALLOWED_SHOPS` still lists only the dev store, by design.
+
+**Phase 4 (Verify) is the next build.** It has what it needs: a proven-writable legibility channel
+(`description`), a live agentic publication to read back (Microsoft Copilot on the dev store), and
+now `fixes.published_at` as the "went live at" timestamp to measure uplift against. Read channel
+membership via `product.resourcePublications` and **never** by enumerating `publications` or gating
+on a count field (see Conventions). Phase 0's Railway deploy is still outstanding and is required
+before Phase 5.
 
 ## Session Log
 

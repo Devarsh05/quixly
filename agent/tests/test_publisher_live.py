@@ -24,7 +24,11 @@ import pytest
 
 from app.graph.publisher import _verify, _write_input
 from app.models import Fix, FixStatus, FixType
-from app.services.shopify_admin import ShopifyAdminClient, ShopifyWriteError
+from app.services.shopify_admin import (
+    ShopifyAdminClient,
+    ShopifyAdminError,
+    ShopifyWriteError,
+)
 from app.services.token_provider import TokenProvider
 
 pytestmark = pytest.mark.live
@@ -41,16 +45,27 @@ live_only = pytest.mark.skipif(
 
 
 @pytest.fixture
-async def client():
+async def client(monkeypatch):
     from app.settings import get_settings
 
-    get_settings.cache_clear()  # pick up the real INTERNAL_API_KEY / APP_SHELL_URL
-    assert DEV_STORE in get_settings().publish_allowed_shops, (
+    # conftest's autouse ``settings`` fixture points APP_SHELL_URL/INTERNAL_API_KEY at test
+    # values. Drop them so pydantic reads the REAL ones from agent/.env — this test has to reach
+    # the running app shell, because that is the only sanctioned source of a token.
+    monkeypatch.delenv("APP_SHELL_URL", raising=False)
+    monkeypatch.delenv("INTERNAL_API_KEY", raising=False)
+    get_settings.cache_clear()
+
+    settings = get_settings()
+    assert DEV_STORE in settings.publish_allowed_shops, (
         "refusing to run a live write test against a shop outside the publish allowlist"
     )
+    assert settings.internal_api_key.get_secret_value(), "INTERNAL_API_KEY missing from agent/.env"
+
     # The token comes through the app shell, the SINGLE refresh authority — exactly as the
     # Publisher gets it. This test opens no second token path.
     yield ShopifyAdminClient(DEV_STORE, TokenProvider())
+
+    get_settings.cache_clear()
 
 
 @live_only
@@ -155,13 +170,28 @@ async def test_category_write_lands_the_exact_gid(client):
 
 
 @live_only
-async def test_user_errors_raise_instead_of_reading_as_a_silent_success(client):
-    """``productUpdate`` returns HTTP 200 when it REFUSES a write.
+async def test_a_rejected_write_raises_in_BOTH_of_shopifys_rejection_shapes(client):
+    """Shopify refuses a write in two different shapes, and only one is ``userErrors``.
 
-    This is the exact failure a transport-status check misses, and the reason
-    ``ShopifyWriteError`` exists. Nothing is written: the mutation is rejected.
+    Established live (2026-07-28), not assumed:
+
+    * a **bad TaxonomyCategory GID** — malformed *or* well-formed-but-unknown — comes back as a
+      **top-level GraphQL error** (``INVALID_PRODUCT_TAXONOMY_NODE_ID``), which ``execute``
+      already raises as ``ShopifyAdminError``;
+    * a **nonexistent product** comes back as **HTTP 200 with ``userErrors``** and a null
+      ``product`` — the silent-success trap, which ``update_product`` raises as
+      ``ShopifyWriteError``.
+
+    The Publisher catches ``ShopifyAdminError``, and ``ShopifyWriteError`` subclasses it, so BOTH
+    land on ``publish_failed``. Asserting only the ``userErrors`` shape would have left the
+    commoner category rejection untested.
     """
-    with pytest.raises(ShopifyWriteError):
+    with pytest.raises(ShopifyAdminError):
         await client.update_product(
-            {"id": PRODUCT_GID, "category": "gid://shopify/TaxonomyCategory/not-a-real-category"}
+            {"id": PRODUCT_GID, "category": "gid://shopify/TaxonomyCategory/zz-9-9-9"}
+        )
+
+    with pytest.raises(ShopifyWriteError, match="does not exist"):
+        await client.update_product(
+            {"id": "gid://shopify/Product/1", "descriptionHtml": "<p>never written</p>"}
         )

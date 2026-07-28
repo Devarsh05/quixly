@@ -576,3 +576,86 @@ it**, and the blocker is a scope, not a query shape:
    GID) was already proven writable at L1 — it needs no metaobject resolution.
 
 **No code changed. No writes.** The probe script was deleted after this record was written.
+
+---
+
+# Step 4 — the Publisher: the write surface, PROVEN LIVE (2026-07-28)
+
+The Publisher shipped on the two paths this document called proven. Every claim below is a live
+call against `quixly-ljymkoyb.myshopify.com`, Admin API **2026-07**, token minted through the app
+shell's single refresh authority. Writes were made to the dev store only; each probe restored what
+it touched.
+
+## L9. `descriptionHtml` round-trips BYTE-FOR-BYTE — **RESOLVED**
+
+The open question behind the Publisher's structural fallback ("does Shopify echo the HTML back
+unchanged?") is answered: **it does.** A write of `original + <p><strong>Details</strong></p><ul>…`
+re-read byte-identical.
+
+```
+BYTE-IDENTITY: Shopify echoed descriptionHtml byte-for-byte
+```
+
+**Consequence:** the exact-equality check is the real verification path. The structural fallback
+(merchant copy still present + every appended `<li>` parsed and present) stays as a **safety net**,
+not a routine path — if it ever fires, it is logged as a warning, and that warning is now a signal
+worth investigating rather than expected noise.
+
+## L10. A refused write arrives in TWO shapes, and only one is `userErrors` — **NEW**
+
+This is the finding most likely to bite a future write path. `productUpdate` does not report all
+rejections the same way:
+
+| Bad input | Shape | Raised as |
+|---|---|---|
+| `category` GID malformed (`…/not-a-real-category`) | **top-level GraphQL `errors`**, `INVALID_PRODUCT_TAXONOMY_NODE_ID` | `ShopifyAdminError` (from `execute`) |
+| `category` GID well-formed but unknown (`…/zz-9-9-9`) | **top-level GraphQL `errors`**, same code | `ShopifyAdminError` |
+| `id` names a nonexistent product | **HTTP 200 + `userErrors: [{field:[id], message:"Product does not exist"}]`**, `product: null` | `ShopifyWriteError` |
+
+So checking `userErrors` alone would miss **both** category rejections, and checking the transport
+status alone would miss the product one. The Publisher catches `ShopifyAdminError`, which
+`ShopifyWriteError` subclasses, so both land on `publish_failed`. **Any future write path must
+handle both shapes.** A `product: null` with no `userErrors` is also treated as a failed write
+rather than assumed successful.
+
+## L11. `base_source_hash` was not writer-stable — **FIXED, and the cause generalises**
+
+`products` has **two writers that store the same column in different shapes**: the GraphQL ingest
+job writes `variants_json` as `{id,title,sku,barcode,price,inventoryQuantity}`, while the
+`products/update` webhook overwrites it with the full REST variant object. Hashing the raw JSONB
+therefore yields a different digest for the same product depending on which writer touched it last
+— and **our own publish fires that webhook moments later**, so a live re-read could never reproduce
+a stored digest and the staleness gate would have refused every write (fail-safe, but the feature
+would look broken).
+
+Fixed by hashing a **projection both writers spell identically** (`services.catalog
+.stable_source_hash`): scalar text columns, a per-variant `title/sku/barcode/price` subset, and
+sorted `namespace.key=value` metafields, with the body stripped of markup. `_build_source_fields`
+is untouched, so grounding is unchanged. `category` is deliberately excluded — assigning one is
+itself a fix, and hashing it would make a category publish stale its own product's siblings.
+
+**Generalises:** any cross-writer comparison in this codebase must go through a normalised
+projection, never a raw JSONB column.
+
+## L12. End-to-end on the dev store — **the write, the re-read, and the refusals**
+
+Real pipeline, not a script: fix run → approve via the gate → `POST …/fixes/publish` → arq job →
+Publisher → Shopify → re-read → DB.
+
+| # | What | Evidence |
+|---|---|---|
+| 1 | **description write lands** — Colombia Huila (`…225139`) | body 146 → 211 chars; live re-read shows `…every single morning.</p><p><strong>Details</strong></p><ul><li>Origin: Colombia</li></ul>`; merchant copy intact as a prefix. `status=verified`, `published_at=14:50:34Z`, `publish_error` NULL |
+| 2 | **category write lands** — Kenya AA (`…257907`) | live category `…/na` (Uncategorized) → `…/fb-1-3-1`, `fullName` confirmed by re-read. `status=verified`, `published_at=14:51:27Z` |
+| 3 | **replay writes nothing** — fix 9702 forced back to `approved` | product `updatedAt` stayed **`14:50:33Z`** across a 14:52:09 publish run — Shopify saw **no mutation**. One `<strong>Details</strong>` block, body still 211 chars. Reconciliation re-verified it without writing |
+| 4 | **staleness refuses** — Decaf (`…356211`) edited after approval | `status=stale`, `published_at` NULL, `publish_error` = "the product data this fix was grounded on has changed since it was approved". Live body carries the merchant's edit and **no** Details block |
+| 5 | **publish with nothing approved** | HTTP **409**, no run enqueued — "publish" never silently does nothing |
+
+Note on #3: "the body is unchanged" alone would NOT have proved reconciliation, because
+`after_json` is fixed at propose time, so a re-write would have produced the same bytes. The
+`updatedAt` timestamp is what proves no mutation was issued.
+
+## Still deferred, unchanged
+
+The **taxonomy metafield** path remains blocked on `read_metaobject_definitions` (L6). The
+Publisher does not merely skip those rows — an approved `metafield` row **aborts the run**, because
+Step 3 refuses to approve one and its presence would mean the gate was bypassed.
