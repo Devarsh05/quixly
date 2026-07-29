@@ -17,17 +17,39 @@ scan needs no Shopify token, so ``TokenProvider`` (on ``ctx``) is deliberately u
 
 import logging
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.db import SessionLocal
 from app.graph.engine_runner import run_engine
 from app.graph.extractor import run_extractor
+from app.graph.interrogator import QueryPanel
 from app.graph.share_of_model import run_share_of_model
 from app.models import AgentRun, AgentRunStatus
-from app.services.extractor_llm import OpenAIExtractorClient
+from app.services.extractor_llm import ExtractorClient, OpenAIExtractorClient
 from app.services.panels import load_query_panel
-from app.services.perplexity import PerplexitySonarClient
+from app.services.perplexity import EngineClient, PerplexitySonarClient
 from app.services.runs import complete_agent_run
 
 logger = logging.getLogger(__name__)
+
+
+async def run_scan_pipeline(
+    session: AsyncSession,
+    run: AgentRun,
+    panel: QueryPanel,
+    engine_client: EngineClient,
+    extractor_client: ExtractorClient,
+) -> None:
+    """The measurement pipeline: EngineRunner → Extractor → ShareOfModelAggregator.
+
+    Extracted so the Phase 4 verify job runs the SAME pipeline rather than a second copy of it —
+    a forked scan would silently drift from the one that produced every baseline. Each node commits
+    its own writes (unchanged); the CALLER owns the run's terminal status and the load-bearing
+    commit that persists it.
+    """
+    await run_engine(session, panel, run.shop_id, engine_client, run_id=run.id)
+    await run_extractor(session, run.panel_id, extractor_client, run_id=run.id)
+    await run_share_of_model(session, run.id)
 
 
 async def run_scan_task(ctx: dict, run_id: int) -> None:
@@ -39,14 +61,10 @@ async def run_scan_task(ctx: dict, run_id: int) -> None:
         run = await session.get(AgentRun, run_id)
         if run is None:
             raise ValueError(f"agent_run {run_id} not found")
-        shop_id = run.shop_id
-        panel_id = run.panel_id
-        panel = await load_query_panel(session, panel_id)
+        panel = await load_query_panel(session, run.panel_id)
 
         try:
-            await run_engine(session, panel, shop_id, engine_client, run_id=run_id)
-            await run_extractor(session, panel_id, extractor_client, run_id=run_id)
-            await run_share_of_model(session, run_id)
+            await run_scan_pipeline(session, run, panel, engine_client, extractor_client)
             await complete_agent_run(session, run_id, AgentRunStatus.completed)
             await session.commit()  # load-bearing: persists status=completed
         except Exception:
