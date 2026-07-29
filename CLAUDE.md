@@ -489,7 +489,12 @@ Only items confirmed by committed code or a session log are checked.
       anchored to `fixes.published_at`. Reuses the Phase 2 nodes via the extracted
       `jobs.scan.run_scan_pipeline` — a verification run IS a scan run. Migration `2bf30ca663a2`
       (`verifications`, grain `(run_id, engine)`; PRD §8's `fix_id` grain superseded). Invariants in
-      Conventions. **Not yet run live** — dev-store acceptance is the next step
+      Conventions. **Live-verified on `quixly-ljymkoyb` 2026-07-29** (run 2787 vs baseline 137,
+      `force=true`): every predicted value matched — `pre_rate` byte-equal to run 137, manifest
+      exactly {9710, 9702}, `settle_hours` 12.6068 and `settle_satisfied = false`, both
+      `fixes.published_at` unchanged. `delta = 0.0` is the expected result at 12.6h of a 168h
+      window, not a failure; **the settled re-measurement is available 2026-08-04** and should be
+      run without `force`. Evidence: `docs/session-log/2026-07-29-phase-4-verifier-acceptance.md`
 - [ ] Verifier loop. **A first-party channel EXISTS — uplift verification is NOT forced onto the
       engine panel alone** (2026-07-27, reversing the earlier UNKNOWN): the dev store carries an
       ACTIVE Microsoft Copilot agentic publication with product 113 published to it, so a
@@ -515,14 +520,22 @@ Publisher writes to a live store and verifies by re-reading (steps 2b–4, all l
   merchant consent) plus proof the metaobject entry surface populates — see `docs/backlog.md`;
 - `PUBLISH_ALLOWED_SHOPS` still lists only the dev store, by design.
 
-**Phase 4 Step 1 (Verifier measurement core) is built and green locally — but NOT yet run live.**
-The immediate next action is the **dev-store acceptance run**: baseline is run **137**
-(2026-07-21, `our_rate` 0.0, 24 queries, panel 316); the measured set is fixes **9702**
-(`description`, Colombia Huila) and **9710** (`category`, Kenya AA), published 2026-07-28
-14:51:27Z / 14:52:09Z. The 168h settle window is not met until **2026-08-04**, so the run needs
-`force=true` and must land `settle_satisfied = false` — confirming that labelling is itself part
-of the acceptance. Then verify by SQL that `pre_rate` matches run 137's persisted row, the manifest
-names exactly those two fixes, and **`fixes.published_at` is unchanged on both**.
+**Phase 4 Step 1 (Verifier measurement core) is live-verified** — the dev-store acceptance run
+landed 2026-07-29 (run **2787** against baseline **137**, `force=true`, one verifications row,
+`delta = 0.0` at 12.6h elapsed). Two things carry forward:
+- **The settled re-measurement is due 2026-08-04**, when the 168h window is met. Run it **without**
+  `force` — it must land `settle_satisfied = true`, and it is the first run that can show real
+  movement (at 12.6h no engine had re-crawled, so `delta = 0.0` measured nothing).
+- The **empty-measured-set 409** is the one branch left **test-covered but not live-exercised**
+  (`tests/test_verify_route.py:151`): `shops` holds exactly one row, so probing it live would mean
+  fabricating a shop. Close it whenever a second shop exists.
+Two operational notes the acceptance run surfaced: **`arq` does not hot-reload**, so a worker
+started before a job module was added silently wedges the run `running` on an unknown function —
+restart the worker (only the arq PIDs; `python.exe /F` takes uvicorn with it) and confirm the
+`Starting worker for N functions:` line lists the task **before** POSTing. And when both sides of
+a delta hold the same headline value, **provenance is only provable from a secondary field that
+moved** — here the competitor rates, which is what proved the Verifier read the post run's own
+aggregates rather than the baseline's twice.
 
 After that: the uplift chart, scheduled weekly scans (which also keep the refresh chain warm), and
 Browserbase simulation. Read channel membership via `product.resourcePublications` and **never** by
