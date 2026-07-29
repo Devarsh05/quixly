@@ -358,8 +358,18 @@ they **break the chain and force the merchant to reinstall**.
   - **A baseline is identified by what it PRODUCED, not by status or panel.** Every run on the dev
     store is `completed` on the same `panel_id` (fix/publish runs borrow one), and one is
     `completed` with zero aggregates. Selection requires `EXISTS (share_of_model WHERE run_id …)`.
-    The baseline anchor is **`max(published_at)`, not `min`** — anchoring on the earliest publish
-    makes a shop that published once long ago permanently unverifiable.
+    **The baseline anchor is ONE two-tier rule, derived inside `select_baseline_run` and never
+    passed in by a caller** (a caller that computes it is a caller that can get it wrong — one
+    did): *the latest scan predating `min(published_at)`, if one exists; otherwise the latest scan
+    predating `max(published_at)`.* Tier one is primary — a `max`-only anchor picks a baseline
+    sitting **between** staggered publishes, which bakes the earlier fix into the pre-rate *and*
+    drops it from M, systematically **understating uplift**. Tier two exists because a `min`-only
+    anchor silently bricks a real install pattern (install → publish → first scan later): nothing
+    predates that publish, so the shop becomes **permanently unmeasurable**, forever, including
+    for everything it publishes afterwards. On the fallback tier M is deliberately a **subset**
+    (`resolve_measured_set`'s `after` filter drops the pre-baseline fixes) — honest, because no
+    pre-state for those fixes exists anywhere in the data, and **`measured_fixes_json` must name
+    only what was actually measured**. Never persist a manifest wider than M.
   - **Settle window: `VERIFY_SETTLE_HOURS` (default 168h).** Inside it the route 409s unless
     `force=true`, which is a **label, not a bypass**: the row persists real `settle_hours` and
     `settle_satisfied = false`, so an early measurement can never be read back as a settled one.

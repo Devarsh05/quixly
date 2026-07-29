@@ -59,7 +59,11 @@ async def resolve_measured_set(
       "went live" mean something, and it should not depend on another module's discipline.
     * ``published_at > after`` when a baseline is already chosen: a fix that went live before the
       baseline scan finished is already baked INTO the baseline, so counting it as measured would
-      credit the window with a change it never saw.
+      credit the window with a change it never saw. On ``select_baseline_run``'s primary tier this
+      filter excludes nothing (the baseline already predates every published fix); on its fallback
+      tier it is what correctly narrows M to the measurable subset, and it also carries the
+      pinned-``baseline_run_id`` case. It keeps "measured means after the baseline" true by
+      construction rather than by the selector's good behaviour.
     """
     statement = (
         select(Fix)
@@ -87,31 +91,20 @@ async def resolve_measured_set(
     ]
 
 
-async def select_baseline_run(
+async def _latest_scan_before(
     session: AsyncSession,
     shop_id: int,
-    *,
-    before: datetime,
-    baseline_run_id: int | None = None,
+    cutoff: datetime,
+    baseline_run_id: int | None,
 ) -> AgentRun | None:
-    """The latest completed SCAN run for ``shop_id`` that finished before ``before``.
+    """The most recent completed SCAN run for ``shop_id`` finishing strictly before ``cutoff``.
 
     **"Completed" does not identify a scan, and neither does ``panel_id``.** Every run on the dev
     store — the fix run and four publish runs included — is ``completed`` and carries the same
     ``panel_id``, because ``agent_runs.panel_id`` is NOT NULL and non-scan runs must borrow one.
     One run is ``completed`` with zero ``engine_runs`` and zero ``share_of_model`` rows. So a run
-    qualifies as a baseline only by what it PRODUCED: ``EXISTS (share_of_model WHERE run_id = …)``.
-    This mirrors ``api/fixes.py`` deriving "the latest fix run" from the fixes themselves.
-
-    ``before`` is ``max(published_at)`` over the shop's published history — the MOST RECENT
-    publish, not the earliest. A baseline has to predate the changes being measured, and anchoring
-    on the earliest publish would make a shop that published once long ago permanently
-    unverifiable: no scan could ever be old enough. Anchoring on the latest guarantees at least
-    that publish falls inside the window; the caller then filters the measured set down to fixes
-    that landed after the chosen baseline, so anything already baked into it is excluded.
-
-    With ``baseline_run_id`` set, that run is validated against the same predicates instead of
-    being taken on trust — an explicit override must not be a way around the rules.
+    qualifies only by what it PRODUCED: ``EXISTS (share_of_model WHERE run_id = …)``. This mirrors
+    ``api/fixes.py`` deriving "the latest fix run" from the fixes themselves.
     """
     statement = (
         select(AgentRun)
@@ -119,7 +112,7 @@ async def select_baseline_run(
             AgentRun.shop_id == shop_id,
             AgentRun.status == AgentRunStatus.completed,
             AgentRun.completed_at.is_not(None),
-            AgentRun.completed_at < before,
+            AgentRun.completed_at < cutoff,
             # The scan-ness test: it produced aggregates, so EngineRunner + Extractor + the
             # aggregator all ran under it.
             exists().where(ShareOfModel.run_id == AgentRun.id),
@@ -131,3 +124,54 @@ async def select_baseline_run(
         statement = statement.where(AgentRun.id == baseline_run_id)
 
     return (await session.execute(statement)).scalar_one_or_none()
+
+
+async def select_baseline_run(
+    session: AsyncSession,
+    shop_id: int,
+    *,
+    published: list[MeasuredFix],
+    baseline_run_id: int | None = None,
+) -> AgentRun | None:
+    """The pre-publish baseline scan for ``shop_id``, by one two-tier rule.
+
+        The latest scan predating ``min(published_at)``, if one exists;
+        otherwise the latest scan predating ``max(published_at)``.
+
+    **The anchor is derived HERE, never passed in.** Eligibility ("a baseline must predate a real
+    publish to be a valid pre-state") and selection ("which eligible scan") are different things,
+    and a caller that computes the anchor is a caller that can get it wrong — one did.
+
+    **Tier one, the primary rule, is ``min``.** Anchoring on the LAST publish systematically
+    understates uplift on any shop with staggered publishes: a baseline sitting between two
+    publishes bakes the earlier fix into the pre-rate *and* drops it from the measured set, so the
+    very change being measured is counted as part of the "before". Anchoring on the earliest makes
+    the chosen baseline predate every published fix, so the caller's ``published_at > completed_at``
+    filter excludes nothing and M is as large as it honestly can be.
+
+    **Tier two exists because ``min`` alone silently bricks a real install pattern** — install →
+    publish → first scan only later. Nothing predates that first publish, so a min-only rule
+    returns no baseline and the shop is **permanently unmeasurable**, including for every fix it
+    publishes afterwards. Falling back to ``max`` picks the latest scan that is still a genuine
+    pre-state for at least the most recent publish.
+
+    In the fallback path M is deliberately a **SUBSET**: the caller's ``after`` filter drops any
+    fix published before the chosen baseline. That is the honest outcome, not a compromise —
+    there is no pre-state anywhere in the data to measure those fixes against, so the alternative
+    is not a better number but a fabricated one. The manifest persisted with the result names only
+    what was actually measured, so a subset is never reported as the whole.
+
+    Takes the caller's already-resolved ``published`` snapshot rather than re-querying ``fixes``,
+    so the route still reads the measured set exactly once (Gate 1).
+
+    With ``baseline_run_id`` set, that run is validated against the same predicates instead of
+    being taken on trust — an explicit override must not be a way around the rules.
+    """
+    if not published:
+        # Nothing published means no publish to predate, so no run can be a valid pre-state.
+        return None
+
+    timestamps = [fix.published_at for fix in published]
+    return await _latest_scan_before(
+        session, shop_id, min(timestamps), baseline_run_id
+    ) or await _latest_scan_before(session, shop_id, max(timestamps), baseline_run_id)

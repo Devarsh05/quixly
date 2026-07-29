@@ -64,15 +64,34 @@ re-queried at aggregation time. Otherwise a publish landing in between would let
 merchant already received disagree with the row that finally lands — both internally consistent,
 silently describing different windows.
 
-## A design bug the tests caught
+## The baseline anchor: wrong twice before it was right
 
-The plan said pick a baseline completing before `min(published_at)`. `test_verify_route.py::
-test_fixes_published_before_the_baseline_are_excluded` failed with a 409 on a shop that clearly
-had a usable baseline. Anchoring on the *earliest* publish makes a shop that published once long
-ago **permanently unverifiable** — no scan can ever be old enough. Corrected to
-`max(published_at)`: at least the most recent publish is guaranteed inside the window, and the
-second filter (`published_at > baseline.completed_at`) still excludes anything already baked into
-the baseline. Found by a test, not by reasoning.
+It took two corrections, both driven by a test rather than by reasoning, and neither symmetric.
+
+**First `min`, changed to `max`.** `test_verify_route.py` failed with a 409 on a shop that clearly
+had a usable baseline: anchoring on the *earliest* publish means a shop that published before its
+first scan has nothing old enough to baseline against, and is **permanently unmeasurable** —
+forever, including for everything it publishes later.
+
+**Then `max`, caught in review as wrong the other way.** A `max` anchor picks the latest scan
+predating the *last* publish, which on staggered publishes is a scan sitting **between** two of
+them. That bakes the earlier fix into the pre-rate *and* drops it from M, so the very change being
+measured is counted as part of the "before" — a systematic **understatement of uplift**. The
+suite could not catch it: every test seeded a single `PUBLISHED_AT`, and with one publish `min`
+and `max` are the same value, so the branch was never exercised. The docstring's justification for
+`max` described a case that cannot distinguish the two.
+
+**Resolved as one two-tier rule**, not min-with-an-escape-hatch: *the latest scan predating
+`min(published_at)`, if one exists; otherwise the latest scan predating `max(published_at)`.*
+Tier one keeps M maximal on the normal path; tier two exists solely so the install → publish →
+scan pattern is measurable at all. On the fallback tier M is deliberately a **subset** — no
+pre-state for those fixes exists anywhere in the data, so the alternative isn't a better number,
+it's a fabricated one — and `measured_fixes_json` names only what was actually measured, so a
+subset is never reported as the whole.
+
+The anchor now lives **inside `select_baseline_run`** and is no longer a caller-supplied `before`
+argument. That is the durable part of the fix: both bugs were the *route* computing an anchor, and
+a caller that can compute the anchor is a caller that can get it wrong.
 
 ## Live-DB findings that shaped the code (shop 92, via psql)
 

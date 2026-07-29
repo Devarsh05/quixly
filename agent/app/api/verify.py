@@ -136,14 +136,13 @@ async def start_verification(
     """
     shop = await _resolve_shop(db, shop_domain)
 
-    # THE SNAPSHOT (Gate 1). Resolved once, here, and threaded through the queue unchanged.
+    # THE SNAPSHOT (Gate 1). Resolved once, here, and threaded through the queue unchanged —
+    # ``select_baseline_run`` is handed this list rather than re-querying ``fixes``.
     #
-    # Two steps, deliberately. First the shop's whole published history, to learn ``max`` — the
-    # baseline must predate the MOST RECENT publish, not the earliest. Anchoring on the earliest
-    # would make a shop that published once long ago permanently unverifiable: no scan could ever
-    # be old enough, and every request would 409 with a usable baseline sitting right there.
-    # Then the set is re-filtered against the chosen baseline, so a fix already baked INTO it is
-    # not counted as measured.
+    # The route does NOT compute the baseline anchor; ``select_baseline_run`` owns it (a caller
+    # that computes the anchor is a caller that can get it wrong, and one did). It applies one
+    # two-tier rule — latest scan predating the FIRST publish, else predating the LAST — and the
+    # ``after`` filter below narrows M to whatever that baseline can honestly measure.
     published = await resolve_measured_set(db, shop.id)
     if not published:
         raise HTTPException(
@@ -154,7 +153,7 @@ async def start_verification(
     baseline = await select_baseline_run(
         db,
         shop.id,
-        before=max(fix.published_at for fix in published),
+        published=published,
         baseline_run_id=baseline_run_id,
     )
     if baseline is None:

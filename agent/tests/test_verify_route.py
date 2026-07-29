@@ -236,21 +236,35 @@ async def test_force_enqueues_an_unsettled_run(client, db, shop, panel_id, enque
     assert enqueued[0][3] is True
 
 
-async def test_fixes_published_before_the_baseline_are_excluded(
+async def test_fallback_baseline_measures_a_subset_and_the_manifest_says_so(
     client, db, shop, panel_id, enqueued
 ):
-    """A fix already baked into the baseline is not a change the window can measure."""
-    old_publish = SETTLED_PUBLISH - timedelta(days=30)
-    await _published_fix(db, shop.id, published_at=old_publish)
-    # Baseline completes AFTER that publish but before the second one.
-    await _baseline(db, shop.id, panel_id, completed_at=SETTLED_PUBLISH - timedelta(days=7))
+    """Tier two end-to-end: no scan predates the earliest publish, so the fallback anchor runs.
+
+    The run proceeds (a permanently-409ing shop is the failure this rule exists to prevent), but
+    it measures a SUBSET — and the manifest must name exactly that subset. Measuring some fixes
+    while implying you measured all of them is the real failure mode here, so the manifest
+    assertion is the point of the test, not the 202.
+    """
+    ancient = await _published_fix(db, shop.id, published_at=SETTLED_PUBLISH - timedelta(days=30))
+    # The only scan sits AFTER the ancient publish, so nothing predates it.
+    baseline = await _baseline(
+        db, shop.id, panel_id, completed_at=SETTLED_PUBLISH - timedelta(days=7)
+    )
     recent_fix = await _published_fix(db, shop.id, published_at=SETTLED_PUBLISH)
 
     response = await client.post(f"/shops/by-domain/{SHOP}/verify", headers=HEADERS)
 
     assert response.status_code == 202
-    assert response.json()["measured_fix_count"] == 1
-    assert [fix["fix_id"] for fix in enqueued[0][2]] == [recent_fix.id]
+    body = response.json()
+    assert body["baseline_run_id"] == baseline.id
+    assert body["measured_fix_count"] == 1
+    assert body["settle_satisfied"] is True
+
+    # The manifest handed to the job names ONLY what was measured — never wider than M.
+    manifest_ids = [fix["fix_id"] for fix in enqueued[0][2]]
+    assert manifest_ids == [recent_fix.id]
+    assert ancient.id not in manifest_ids
 
 
 async def test_another_shops_published_fix_is_not_measured(client, db, shop, panel_id, enqueued):
