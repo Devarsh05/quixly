@@ -1,0 +1,16 @@
+# Line endings that are load-bearing inside container images.
+#
+# This repo is developed on Windows with core.autocrlf = true, which rewrites LF to CRLF on
+# checkout. For a shell script that is COPYied into a Linux image that is fatal, and the
+# error is unhelpfully indirect: `#!/usr/bin/env bash\r` makes the kernel look for an
+# interpreter literally named "bash\r" and the container dies with
+# "bad interpreter: No such file or directory". Pin these to LF regardless of platform.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
+
+# Shipped as-is; never newline-translated.
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary
