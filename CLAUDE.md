@@ -105,21 +105,43 @@ they **break the chain and force the merchant to reinstall**.
   runs as multiple processes. **Adding a second refresh path anywhere — a webhook, a job, a
   route — races and invalidates the chain.**
 - `authenticate.webhook()` **is** such a path (it refreshes via `ensureValidOfflineSession`),
-  so webhook routes authenticate through `lib/webhook-auth.server.ts`, under the same lock.
-  `unauthenticated.admin/storefront` also refresh and are deliberately **not re-exported**
-  from `shopify.server.ts`. Known residual: `authenticate.admin()` rotates by *token
-  exchange* and is outside the lock — merchant-present only; do not add more.
-- Known residual: the **webhook refresh path is pool-coupled and can deadlock** under
-  concurrent same-shop webhook refreshes. The lock holds one pooled connection for its whole
-  `$transaction`; the admin-token path runs its inner session I/O on *that* connection, but
-  `authenticate.webhook()` → `ensureValidOfflineSession` refreshes through the library's
-  global-client storage, which can't be pinned to the tx. With a Prisma pool ≤ concurrent
-  refreshes, the lock winner can't get the extra connection it needs and deadlocks. Fix
-  pending (see `docs/backlog.md` → Token custody). Not hypothetical: the admin-token path had
-  this exact deadlock (now fixed by tx-pinning), observed on CI where `admin-token-rotation.test.ts`
-  fires 10 concurrent refreshes against the runner's small default Prisma pool (`num_cpus*2+1`);
-  it masked on higher-core dev machines. There is no `connection_limit`-capped test, and the
-  webhook residual itself is not independently test-covered.
+  so webhook routes authenticate through `lib/webhook-auth.server.ts` — which refreshes the
+  shop **before** calling it, under the lock, so the library finds a fresh token and its own
+  refresh never runs (next bullet). `unauthenticated.admin/storefront` also refresh and are
+  deliberately **not re-exported** from `shopify.server.ts`. Known residual:
+  `authenticate.admin()` rotates by *token exchange* and is outside the lock — merchant-present
+  only; do not add more.
+- **The critical section must borrow ZERO second connections — never wrap library auth in the
+  lock.** `withShopRefreshLock` holds `pg_advisory_xact_lock` inside a `$transaction`, pinning
+  one pooled connection; anything inside it that reaches the DB through the **global** Prisma
+  client needs a second one, and with a pool ≤ concurrent same-shop webhooks the lock winner
+  can never get it. Prisma breaks the deadlock by timing out (`P2024`), so it surfaces as failed
+  webhooks and Shopify redeliveries, not a hung process. On a 1-vCPU container the default pool
+  is `num_cpus*2+1` = **3**, and `products/update` fans out on bulk edits *and* on our own
+  publishes. Both refresh paths are now tx-pinned: the admin-token path via `refreshUnderLock`,
+  and the webhook path by calling **`ensureFreshOfflineSession`** (same authority, same
+  tx-pinned section) and then running `authenticate.webhook()` with **no transaction open**.
+  Wrapping it was the old bug: `createOrLoadOfflineSession` calls `loadSession` on the global
+  client *unconditionally, before any expiry check*, so **every** webhook borrowed the second
+  connection — not only refreshing ones. Proven by `tests/webhook-refresh-single-connection.test.ts`,
+  which runs at **`connection_limit=1`**: a section needing two connections cannot complete on a
+  pool of one, so passing is structural, not timing-dependent. (Observed: the admin-token path had
+  the same deadlock on CI, masked on higher-core dev machines.)
+- **`WEBHOOK_REFRESH_WINDOW_MS` (10 min) must stay wider than the library's internal 5-minute
+  threshold.** That is what makes the library's unlocked refresh unreachable: either we
+  refreshed (~60 min headroom) or the token had ≥10 min left moments ago, and the lock's
+  `maxWait` + `timeout` cap "moments" at ~35s. The library's constant is **not exported** and can
+  move on a dependency bump, so the invariant is guarded by probing the library's real behaviour
+  (`webhook-refresh-single-connection.test.ts` → "keeps the library's own refresh threshold
+  strictly inside ours"). Never narrow the window below 5 minutes.
+- **The webhook shop is read pre-HMAC, deliberately.** `X-Shopify-Shop-Domain` picks the lock and
+  now also the shop to refresh, before `authenticate.webhook()` verifies anything — it has to,
+  because verification happens inside that call. It authorizes nothing and returns nothing. A
+  forged request cannot raise a shop's refresh *rate*: one rotation pushes the token ~60 min out,
+  so every later forgery is a no-op read; the most it can do is advance a refresh already due
+  within the window. That rules out exhausting Shopify's OAuth rate limit to starve real
+  refreshes. On a transient refresh failure the request **503s rather than proceeding** — passing
+  a still-expired session on a live chain to the library would refresh it outside the lock.
 - Do not disable `future.expiringOfflineAccessTokens` — public apps created after
   2026-04-01 must use it.
 - The **agent stores no Shopify token or refresh token.** Ever. No `shops.access_token_ref`
@@ -174,7 +196,10 @@ they **break the chain and force the merchant to reinstall**.
   jobs, routes) races and invalidates the chain. Permanent failures (no session row, dead
   refresh chain) → **404 → `reauth_required`**. Transient (5xx/network) → **502 → retry**.
   **Never conflate the two** — conflating them retries a dead shop forever, or brands a
-  healthy one. Full detail in "Shopify token custody" above.
+  healthy one. The lock's critical section must also borrow **zero second connections** — never
+  put library auth (or any global-client DB call) inside it; refresh through
+  `ensureFreshOfflineSession` first, then call the library outside the transaction. Full detail
+  in "Shopify token custody" above.
 - Do not edit OAuth, session storage, billing, or webhook-verification code without first
   explaining the risk.
 - Secrets: never hardcode or print API keys / Shopify tokens. Use env vars; keep local
