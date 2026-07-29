@@ -65,11 +65,28 @@ touch the other's** — they have independent, mutually-destructive drift detect
   Without those guards each tool sees the other's tables as drift and emits `DROP`s.
 - **Never add a model to `app/prisma/schema.prisma`.** New tables are Alembic migrations
   in `agent/`. Prisma exists only because the Shopify session-storage adapter needs it.
-- **Do NOT set `version_table_schema` in `agent/alembic/env.py`.** Pinning it makes Alembic
-  compare its own bookkeeping table against the reflected table's `None` schema, its
-  self-exclusion misses, and autogenerate emits `DROP TABLE alembic_version` — destroying
-  the migration history. `alembic_version` is excluded **by name** in `include_object`
-  instead. (Observed, not hypothetical.)
+- **`version_table_schema` IS set — and that makes the by-name exclusion LOAD-BEARING.**
+  `agent/alembic/env.py` passes `version_table_schema=OWNED_SCHEMA` to `context.configure`.
+  Pinning it makes Alembic compare its own bookkeeping table against the reflected table's
+  `None` schema, so its built-in self-exclusion misses and autogenerate emits
+  `DROP TABLE alembic_version` — which would destroy the migration history. What actually
+  stops that is the **name-based** exclusion at the top of `include_object`
+  (`if type_ == "table" and name == VERSION_TABLE: return False`). It fully neutralizes the
+  DROP, so the current combination is safe — but **only because that line is there.**
+  **Never delete the by-name exclusion**, and never assume Alembic's own self-exclusion is
+  covering you: with `version_table_schema` pinned, it is not.
+  Measured locally 2026-07-29, three cases, same DB at head with `shopify.Session` present:
+
+  | `version_table_schema` | by-name exclusion | autogenerate result |
+  |---|---|---|
+  | `OWNED_SCHEMA` | present | **empty** — current code |
+  | `OWNED_SCHEMA` | removed | `op.drop_table('alembic_version')` |
+  | unset | removed | empty |
+
+  (An earlier revision of this file said "do NOT set `version_table_schema`". The code has
+  set it for some time and the fence held, because the by-name guard was doing the work.
+  Either arrangement is safe on its own; what is **not** safe is pinning the schema while
+  removing the name guard. Reconciled to the code, with the coupling made explicit.)
 - After changing either schema, run the **drift check** (see Commands) and confirm the diff
   is **empty**. A non-empty diff means a guard is broken.
 - `prisma migrate dev` is **LOCAL ONLY** — it can reset the database. Deployed
@@ -146,10 +163,11 @@ they **break the chain and force the merchant to reinstall**.
   `category` fix type) has tax/channel consequences and is approval-gated like a store publish —
   never bundled as a low-risk metafield. It is the precondition for every taxonomy attribute write.
 - **Schema ownership.** `shopify` schema = Prisma (`Session` + `_prisma_migrations`).
-  `public` = Alembic (everything else). **Neither tool may touch the other's.** Do NOT set
-  `version_table_schema` in Alembic's `env.py` — it disables Alembic's self-exclusion and
-  makes autogenerate emit `DROP TABLE alembic_version`; the table is excluded by name
-  instead. Full detail in "Schema ownership" above.
+  `public` = Alembic (everything else). **Neither tool may touch the other's.** Alembic's
+  `env.py` **does** set `version_table_schema`, which disables Alembic's built-in
+  self-exclusion — so the **by-name** exclusion of `alembic_version` in `include_object` is
+  the only thing preventing a `DROP TABLE alembic_version`. Never remove it. Full detail
+  (incl. the measured three-case table) in "Schema ownership" above.
 - **Token authority.** The agent **NEVER** stores a Shopify token or refresh token.
   `app/lib/admin-token.server.ts` is the SINGLE refresh authority, and refresh is serialized
   per shop with a Postgres advisory lock. Adding a second refresh path anywhere (webhooks,
@@ -418,6 +436,32 @@ they **break the chain and force the merchant to reinstall**.
   (Observed 2026-07-21 — a green 200 masking zero DB effect.)
 - **`prisma migrate dev` is LOCAL ONLY** — it can reset the database. Deployed environments
   use `prisma migrate deploy` (this is what CI runs).
+- **Containerisation (Phase 0 deploy, Stage A) — four rules that are easy to break silently.**
+  - **A `.dockerignore` is a secret boundary, not a build optimisation.** Both Dockerfiles
+    `COPY . .`, and a file copied into a layer stays in that layer forever — deleting it in a
+    later step does not remove it. `app/.dockerignore` and `agent/.dockerignore` must keep
+    excluding `.env` / `.env.*` (and, app-side, `.shopify`, which holds a local TLS private
+    key). Verified by building and scanning, not by reading the file. **Scan the decompressed
+    layer blobs, not the flattened filesystem** — and never with `grep -q` inside a
+    `pipefail` pipeline: the decompressor takes SIGPIPE on the early exit and a real hit is
+    reported as a clean PASS. (Observed 2026-07-29, both the leak and the false PASS.)
+  - **DATABASE_URL carries NO TLS parameter, either side.** asyncpg rejects `?sslmode=`,
+    psycopg rejects `?ssl=`, and `alembic/env.py` derives its sync URL by replacing
+    `+asyncpg` with `+psycopg` — carrying the query string across to the driver that cannot
+    read it. TLS is per-driver instead: `DATABASE_SSL` (asyncpg, via `connect_args` in
+    `app/db.py`) and `PGSSLMODE` (libpq, for the Alembic leg). Default `prefer`, because the
+    local and CI Postgres containers run `ssl = off` and **reject** an SSL upgrade outright;
+    deployed environments set both to `require`. No provider endpoint is hardcoded anywhere.
+  - **The agent container runs EXACTLY ONE arq process.** `poll_delay = 15` sizes the idle
+    Redis command rate against a 500K/month free ceiling; the cost is per-process, so a
+    second replica doubles it straight through. The jobs are keyed per shop, not sharded — a
+    second replica buys nothing anyway.
+  - **The agent container must DIE when either child dies.** `alembic upgrade head` runs
+    once in `docker-entrypoint.sh`, never inside the supervisor and never per-process; then
+    `wait -n` takes the container down on the first child to exit. A half-alive container
+    (arq wedged, uvicorn still green) is the worst outcome available — it is exactly the
+    wedge that cost a Phase 4 acceptance run, with the health check reporting healthy.
+    Requires bash: `wait -n` is not POSIX and Debian's `/bin/sh` is dash.
 - Do not put running task lists or plans in this file (they go stale) — those live in the PR/issue.
 
 ## Git
