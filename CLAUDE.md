@@ -65,11 +65,28 @@ touch the other's** — they have independent, mutually-destructive drift detect
   Without those guards each tool sees the other's tables as drift and emits `DROP`s.
 - **Never add a model to `app/prisma/schema.prisma`.** New tables are Alembic migrations
   in `agent/`. Prisma exists only because the Shopify session-storage adapter needs it.
-- **Do NOT set `version_table_schema` in `agent/alembic/env.py`.** Pinning it makes Alembic
-  compare its own bookkeeping table against the reflected table's `None` schema, its
-  self-exclusion misses, and autogenerate emits `DROP TABLE alembic_version` — destroying
-  the migration history. `alembic_version` is excluded **by name** in `include_object`
-  instead. (Observed, not hypothetical.)
+- **`version_table_schema` IS set — and that makes the by-name exclusion LOAD-BEARING.**
+  `agent/alembic/env.py` passes `version_table_schema=OWNED_SCHEMA` to `context.configure`.
+  Pinning it makes Alembic compare its own bookkeeping table against the reflected table's
+  `None` schema, so its built-in self-exclusion misses and autogenerate emits
+  `DROP TABLE alembic_version` — which would destroy the migration history. What actually
+  stops that is the **name-based** exclusion at the top of `include_object`
+  (`if type_ == "table" and name == VERSION_TABLE: return False`). It fully neutralizes the
+  DROP, so the current combination is safe — but **only because that line is there.**
+  **Never delete the by-name exclusion**, and never assume Alembic's own self-exclusion is
+  covering you: with `version_table_schema` pinned, it is not.
+  Measured locally 2026-07-29, three cases, same DB at head with `shopify.Session` present:
+
+  | `version_table_schema` | by-name exclusion | autogenerate result |
+  |---|---|---|
+  | `OWNED_SCHEMA` | present | **empty** — current code |
+  | `OWNED_SCHEMA` | removed | `op.drop_table('alembic_version')` |
+  | unset | removed | empty |
+
+  (An earlier revision of this file said "do NOT set `version_table_schema`". The code has
+  set it for some time and the fence held, because the by-name guard was doing the work.
+  Either arrangement is safe on its own; what is **not** safe is pinning the schema while
+  removing the name guard. Reconciled to the code, with the coupling made explicit.)
 - After changing either schema, run the **drift check** (see Commands) and confirm the diff
   is **empty**. A non-empty diff means a guard is broken.
 - `prisma migrate dev` is **LOCAL ONLY** — it can reset the database. Deployed
@@ -88,21 +105,43 @@ they **break the chain and force the merchant to reinstall**.
   runs as multiple processes. **Adding a second refresh path anywhere — a webhook, a job, a
   route — races and invalidates the chain.**
 - `authenticate.webhook()` **is** such a path (it refreshes via `ensureValidOfflineSession`),
-  so webhook routes authenticate through `lib/webhook-auth.server.ts`, under the same lock.
-  `unauthenticated.admin/storefront` also refresh and are deliberately **not re-exported**
-  from `shopify.server.ts`. Known residual: `authenticate.admin()` rotates by *token
-  exchange* and is outside the lock — merchant-present only; do not add more.
-- Known residual: the **webhook refresh path is pool-coupled and can deadlock** under
-  concurrent same-shop webhook refreshes. The lock holds one pooled connection for its whole
-  `$transaction`; the admin-token path runs its inner session I/O on *that* connection, but
-  `authenticate.webhook()` → `ensureValidOfflineSession` refreshes through the library's
-  global-client storage, which can't be pinned to the tx. With a Prisma pool ≤ concurrent
-  refreshes, the lock winner can't get the extra connection it needs and deadlocks. Fix
-  pending (see `docs/backlog.md` → Token custody). Not hypothetical: the admin-token path had
-  this exact deadlock (now fixed by tx-pinning), observed on CI where `admin-token-rotation.test.ts`
-  fires 10 concurrent refreshes against the runner's small default Prisma pool (`num_cpus*2+1`);
-  it masked on higher-core dev machines. There is no `connection_limit`-capped test, and the
-  webhook residual itself is not independently test-covered.
+  so webhook routes authenticate through `lib/webhook-auth.server.ts` — which refreshes the
+  shop **before** calling it, under the lock, so the library finds a fresh token and its own
+  refresh never runs (next bullet). `unauthenticated.admin/storefront` also refresh and are
+  deliberately **not re-exported** from `shopify.server.ts`. Known residual:
+  `authenticate.admin()` rotates by *token exchange* and is outside the lock — merchant-present
+  only; do not add more.
+- **The critical section must borrow ZERO second connections — never wrap library auth in the
+  lock.** `withShopRefreshLock` holds `pg_advisory_xact_lock` inside a `$transaction`, pinning
+  one pooled connection; anything inside it that reaches the DB through the **global** Prisma
+  client needs a second one, and with a pool ≤ concurrent same-shop webhooks the lock winner
+  can never get it. Prisma breaks the deadlock by timing out (`P2024`), so it surfaces as failed
+  webhooks and Shopify redeliveries, not a hung process. On a 1-vCPU container the default pool
+  is `num_cpus*2+1` = **3**, and `products/update` fans out on bulk edits *and* on our own
+  publishes. Both refresh paths are now tx-pinned: the admin-token path via `refreshUnderLock`,
+  and the webhook path by calling **`ensureFreshOfflineSession`** (same authority, same
+  tx-pinned section) and then running `authenticate.webhook()` with **no transaction open**.
+  Wrapping it was the old bug: `createOrLoadOfflineSession` calls `loadSession` on the global
+  client *unconditionally, before any expiry check*, so **every** webhook borrowed the second
+  connection — not only refreshing ones. Proven by `tests/webhook-refresh-single-connection.test.ts`,
+  which runs at **`connection_limit=1`**: a section needing two connections cannot complete on a
+  pool of one, so passing is structural, not timing-dependent. (Observed: the admin-token path had
+  the same deadlock on CI, masked on higher-core dev machines.)
+- **`WEBHOOK_REFRESH_WINDOW_MS` (10 min) must stay wider than the library's internal 5-minute
+  threshold.** That is what makes the library's unlocked refresh unreachable: either we
+  refreshed (~60 min headroom) or the token had ≥10 min left moments ago, and the lock's
+  `maxWait` + `timeout` cap "moments" at ~35s. The library's constant is **not exported** and can
+  move on a dependency bump, so the invariant is guarded by probing the library's real behaviour
+  (`webhook-refresh-single-connection.test.ts` → "keeps the library's own refresh threshold
+  strictly inside ours"). Never narrow the window below 5 minutes.
+- **The webhook shop is read pre-HMAC, deliberately.** `X-Shopify-Shop-Domain` picks the lock and
+  now also the shop to refresh, before `authenticate.webhook()` verifies anything — it has to,
+  because verification happens inside that call. It authorizes nothing and returns nothing. A
+  forged request cannot raise a shop's refresh *rate*: one rotation pushes the token ~60 min out,
+  so every later forgery is a no-op read; the most it can do is advance a refresh already due
+  within the window. That rules out exhausting Shopify's OAuth rate limit to starve real
+  refreshes. On a transient refresh failure the request **503s rather than proceeding** — passing
+  a still-expired session on a live chain to the library would refresh it outside the lock.
 - Do not disable `future.expiringOfflineAccessTokens` — public apps created after
   2026-04-01 must use it.
 - The **agent stores no Shopify token or refresh token.** Ever. No `shops.access_token_ref`
@@ -146,17 +185,21 @@ they **break the chain and force the merchant to reinstall**.
   `category` fix type) has tax/channel consequences and is approval-gated like a store publish —
   never bundled as a low-risk metafield. It is the precondition for every taxonomy attribute write.
 - **Schema ownership.** `shopify` schema = Prisma (`Session` + `_prisma_migrations`).
-  `public` = Alembic (everything else). **Neither tool may touch the other's.** Do NOT set
-  `version_table_schema` in Alembic's `env.py` — it disables Alembic's self-exclusion and
-  makes autogenerate emit `DROP TABLE alembic_version`; the table is excluded by name
-  instead. Full detail in "Schema ownership" above.
+  `public` = Alembic (everything else). **Neither tool may touch the other's.** Alembic's
+  `env.py` **does** set `version_table_schema`, which disables Alembic's built-in
+  self-exclusion — so the **by-name** exclusion of `alembic_version` in `include_object` is
+  the only thing preventing a `DROP TABLE alembic_version`. Never remove it. Full detail
+  (incl. the measured three-case table) in "Schema ownership" above.
 - **Token authority.** The agent **NEVER** stores a Shopify token or refresh token.
   `app/lib/admin-token.server.ts` is the SINGLE refresh authority, and refresh is serialized
   per shop with a Postgres advisory lock. Adding a second refresh path anywhere (webhooks,
   jobs, routes) races and invalidates the chain. Permanent failures (no session row, dead
   refresh chain) → **404 → `reauth_required`**. Transient (5xx/network) → **502 → retry**.
   **Never conflate the two** — conflating them retries a dead shop forever, or brands a
-  healthy one. Full detail in "Shopify token custody" above.
+  healthy one. The lock's critical section must also borrow **zero second connections** — never
+  put library auth (or any global-client DB call) inside it; refresh through
+  `ensureFreshOfflineSession` first, then call the library outside the transaction. Full detail
+  in "Shopify token custody" above.
 - Do not edit OAuth, session storage, billing, or webhook-verification code without first
   explaining the risk.
 - Secrets: never hardcode or print API keys / Shopify tokens. Use env vars; keep local
@@ -418,6 +461,32 @@ they **break the chain and force the merchant to reinstall**.
   (Observed 2026-07-21 — a green 200 masking zero DB effect.)
 - **`prisma migrate dev` is LOCAL ONLY** — it can reset the database. Deployed environments
   use `prisma migrate deploy` (this is what CI runs).
+- **Containerisation (Phase 0 deploy, Stage A) — four rules that are easy to break silently.**
+  - **A `.dockerignore` is a secret boundary, not a build optimisation.** Both Dockerfiles
+    `COPY . .`, and a file copied into a layer stays in that layer forever — deleting it in a
+    later step does not remove it. `app/.dockerignore` and `agent/.dockerignore` must keep
+    excluding `.env` / `.env.*` (and, app-side, `.shopify`, which holds a local TLS private
+    key). Verified by building and scanning, not by reading the file. **Scan the decompressed
+    layer blobs, not the flattened filesystem** — and never with `grep -q` inside a
+    `pipefail` pipeline: the decompressor takes SIGPIPE on the early exit and a real hit is
+    reported as a clean PASS. (Observed 2026-07-29, both the leak and the false PASS.)
+  - **DATABASE_URL carries NO TLS parameter, either side.** asyncpg rejects `?sslmode=`,
+    psycopg rejects `?ssl=`, and `alembic/env.py` derives its sync URL by replacing
+    `+asyncpg` with `+psycopg` — carrying the query string across to the driver that cannot
+    read it. TLS is per-driver instead: `DATABASE_SSL` (asyncpg, via `connect_args` in
+    `app/db.py`) and `PGSSLMODE` (libpq, for the Alembic leg). Default `prefer`, because the
+    local and CI Postgres containers run `ssl = off` and **reject** an SSL upgrade outright;
+    deployed environments set both to `require`. No provider endpoint is hardcoded anywhere.
+  - **The agent container runs EXACTLY ONE arq process.** `poll_delay = 15` sizes the idle
+    Redis command rate against a 500K/month free ceiling; the cost is per-process, so a
+    second replica doubles it straight through. The jobs are keyed per shop, not sharded — a
+    second replica buys nothing anyway.
+  - **The agent container must DIE when either child dies.** `alembic upgrade head` runs
+    once in `docker-entrypoint.sh`, never inside the supervisor and never per-process; then
+    `wait -n` takes the container down on the first child to exit. A half-alive container
+    (arq wedged, uvicorn still green) is the worst outcome available — it is exactly the
+    wedge that cost a Phase 4 acceptance run, with the health check reporting healthy.
+    Requires bash: `wait -n` is not POSIX and Debian's `/bin/sh` is dash.
 - Do not put running task lists or plans in this file (they go stale) — those live in the PR/issue.
 
 ## Git
@@ -489,7 +558,12 @@ Only items confirmed by committed code or a session log are checked.
       anchored to `fixes.published_at`. Reuses the Phase 2 nodes via the extracted
       `jobs.scan.run_scan_pipeline` — a verification run IS a scan run. Migration `2bf30ca663a2`
       (`verifications`, grain `(run_id, engine)`; PRD §8's `fix_id` grain superseded). Invariants in
-      Conventions. **Not yet run live** — dev-store acceptance is the next step
+      Conventions. **Live-verified on `quixly-ljymkoyb` 2026-07-29** (run 2787 vs baseline 137,
+      `force=true`): every predicted value matched — `pre_rate` byte-equal to run 137, manifest
+      exactly {9710, 9702}, `settle_hours` 12.6068 and `settle_satisfied = false`, both
+      `fixes.published_at` unchanged. `delta = 0.0` is the expected result at 12.6h of a 168h
+      window, not a failure; **the settled re-measurement is available 2026-08-04** and should be
+      run without `force`. Evidence: `docs/session-log/2026-07-29-phase-4-verifier-acceptance.md`
 - [ ] Verifier loop. **A first-party channel EXISTS — uplift verification is NOT forced onto the
       engine panel alone** (2026-07-27, reversing the earlier UNKNOWN): the dev store carries an
       ACTIVE Microsoft Copilot agentic publication with product 113 published to it, so a
@@ -515,14 +589,22 @@ Publisher writes to a live store and verifies by re-reading (steps 2b–4, all l
   merchant consent) plus proof the metaobject entry surface populates — see `docs/backlog.md`;
 - `PUBLISH_ALLOWED_SHOPS` still lists only the dev store, by design.
 
-**Phase 4 Step 1 (Verifier measurement core) is built and green locally — but NOT yet run live.**
-The immediate next action is the **dev-store acceptance run**: baseline is run **137**
-(2026-07-21, `our_rate` 0.0, 24 queries, panel 316); the measured set is fixes **9702**
-(`description`, Colombia Huila) and **9710** (`category`, Kenya AA), published 2026-07-28
-14:51:27Z / 14:52:09Z. The 168h settle window is not met until **2026-08-04**, so the run needs
-`force=true` and must land `settle_satisfied = false` — confirming that labelling is itself part
-of the acceptance. Then verify by SQL that `pre_rate` matches run 137's persisted row, the manifest
-names exactly those two fixes, and **`fixes.published_at` is unchanged on both**.
+**Phase 4 Step 1 (Verifier measurement core) is live-verified** — the dev-store acceptance run
+landed 2026-07-29 (run **2787** against baseline **137**, `force=true`, one verifications row,
+`delta = 0.0` at 12.6h elapsed). Two things carry forward:
+- **The settled re-measurement is due 2026-08-04**, when the 168h window is met. Run it **without**
+  `force` — it must land `settle_satisfied = true`, and it is the first run that can show real
+  movement (at 12.6h no engine had re-crawled, so `delta = 0.0` measured nothing).
+- The **empty-measured-set 409** is the one branch left **test-covered but not live-exercised**
+  (`tests/test_verify_route.py:151`): `shops` holds exactly one row, so probing it live would mean
+  fabricating a shop. Close it whenever a second shop exists.
+Two operational notes the acceptance run surfaced: **`arq` does not hot-reload**, so a worker
+started before a job module was added silently wedges the run `running` on an unknown function —
+restart the worker (only the arq PIDs; `python.exe /F` takes uvicorn with it) and confirm the
+`Starting worker for N functions:` line lists the task **before** POSTing. And when both sides of
+a delta hold the same headline value, **provenance is only provable from a secondary field that
+moved** — here the competitor rates, which is what proved the Verifier read the post run's own
+aggregates rather than the baseline's twice.
 
 After that: the uplift chart, scheduled weekly scans (which also keep the refresh chain warm), and
 Browserbase simulation. Read channel membership via `product.resourcePublications` and **never** by

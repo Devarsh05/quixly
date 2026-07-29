@@ -1,3 +1,26 @@
+# Build-context exclusions for the app shell image.
+#
+# The Dockerfile does `COPY . .`, so anything reachable here lands in an image layer
+# and stays there permanently — deleting it in a later step does not remove it from
+# the layer it was written to. Secrets must therefore never enter the context at all.
+
+# Build inputs/outputs that the image regenerates for itself.
 .cache
 build
 node_modules
+
+# Secrets. `.env` carries DATABASE_URL credentials and INTERNAL_API_KEY (the shared
+# secret with the agent); a deployed environment supplies these as real env vars.
+# Verified 2026-07-29: without this line the key was readable inside the built image.
+.env
+.env.*
+
+# Shopify CLI local state — holds a TLS private key (`localhost-key.pem`), a bundled
+# mkcert binary, and dev/deploy bundles. None of it belongs in a runtime image.
+.shopify
+
+# Generated route types; `react-router build` regenerates them during the build stage.
+.react-router
+
+# Test sources are build-time only and are not served.
+tests

@@ -152,24 +152,34 @@ the phase by which it should be revisited.
 
 ## Token custody / refresh locking
 
-- **Webhook refresh path is pool-coupled and can deadlock under concurrent same-shop webhook
-  refreshes.** `withShopRefreshLock` (`app/app/lib/shop-lock.server.ts`) runs its critical
-  section inside a `prisma.$transaction`, which pins one pooled connection and holds the
-  `pg_advisory_xact_lock` for the whole transaction. The admin-token path was fixed to run its
-  inner session read/write on that same transaction connection, so it borrows no extra
-  connection. The **webhook** path (`app/app/lib/webhook-auth.server.ts` →
-  `authenticate.webhook()` → the library's `ensureValidOfflineSession`) refreshes through the
-  library's own **global-client** session storage, which cannot be pinned to the transaction
-  client. So it keeps the exact deadlock the admin-side fix removed: with N concurrent
-  same-shop webhook refreshes and a Prisma pool ≤ N, every connection is held by a transaction
-  blocked on the advisory lock, and the lock winner cannot get the extra connection its inner
-  session I/O needs → deadlock (surfaces as a hang/timeout, not an error). Masked on
-  high-core-count hosts where the default pool (`num_cpus*2+1`) exceeds concurrency; reproducible
-  when the pool is small (CI, constrained prod). Candidate fixes: give the webhook lock a
-  **dedicated pinned connection** for its inner refresh, or use a library hook to inject
-  tx-bound session storage into `authenticate.webhook()`. Deliberately left as a separate change
-  — the admin-token fix was scoped to `admin-token.server.ts` and must not touch library-owned
-  auth. _Raised: 2026-07-15 (admin-token tx-pinning fix)._
+- **RESOLVED (2026-07-29): the webhook refresh path no longer borrows a second connection.**
+  `withShopRefreshLock` pins one pooled connection for its whole `$transaction`, and
+  `webhook-auth.server.ts` used to run `authenticate.webhook()` *inside* it. The library reaches
+  session storage through the client bound at `shopifyApp()` construction — the global one — and
+  exposes no seam to inject a tx-bound storage, so the critical section needed a second
+  connection and starved when the pool was ≤ the concurrency. Investigating the fix turned up two
+  corrections to the original entry: (1) `createOrLoadOfflineSession` calls `loadSession`
+  **unconditionally, before any expiry check**, so *every* webhook borrowed the second connection,
+  not only refreshing ones — the threshold was concurrent same-shop **webhooks** (3 on a 1-vCPU
+  box), not concurrent refreshes; (2) Prisma breaks the deadlock with a `P2024` pool timeout, so
+  it surfaces as failed webhooks and Shopify redeliveries rather than a hang. Fixed by refreshing
+  through the existing tx-pinned authority first (`ensureFreshOfflineSession`, wider 10-minute
+  window than the library's 5) and then calling `authenticate.webhook()` with no transaction
+  open; HMAC verification and topic normalization stay entirely library-owned and are neither
+  duplicated nor bypassed. Covered by `tests/webhook-refresh-single-connection.test.ts`
+  (`connection_limit=1` — structural proof) and `tests/webhook-refresh-concurrency.test.ts`
+  (`connection_limit=3`, 5 concurrent). The `connection_limit`-capped test gap noted in CLAUDE.md
+  is closed by the same files. _Raised: 2026-07-15 (admin-token tx-pinning fix); resolved:
+  2026-07-29._
+
+- **Carried forward: a dead refresh chain still 500s a webhook instead of flagging the shop.**
+  When `ensureFreshOfflineSession` throws `ReauthRequiredError`, `webhook-auth.server.ts` logs and
+  passes the request to the library, whose own refresh fails and returns an opaque 500 — so
+  Shopify retries a shop that can never succeed. It cannot be answered earlier: the HMAC is still
+  unverified at that point, so the shop domain is untrusted. Unchanged from before the pool fix,
+  and bounded (only a shop whose refresh token has lapsed). The clean fix is to let the webhook
+  return 200 and mark the shop `reauth_required` **after** the library verifies the HMAC.
+  _Raised: 2026-07-29 (webhook pool-coupling fix)._
 
 ## App shell / tooling
 

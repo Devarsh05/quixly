@@ -21,8 +21,21 @@ class Settings(BaseSettings):
     environment: str = "development"
     log_level: str = "info"
 
-    # Infrastructure
+    # Infrastructure.
+    #
+    # DATABASE_URL must carry NO TLS query parameter. The two drivers spell it differently
+    # and incompatibly — asyncpg rejects `?sslmode=`, psycopg rejects `?ssl=` — and
+    # ``alembic/env.py`` derives its sync URL by replacing `+asyncpg` with `+psycopg`,
+    # which carries the query string across to the driver that cannot read it. TLS is
+    # therefore configured per-driver instead: DATABASE_SSL for the async (asyncpg) leg,
+    # PGSSLMODE for the sync (psycopg/libpq) leg Alembic runs on.
     database_url: str = "postgresql+asyncpg://quixly:quixly@localhost:5432/quixly"
+    # asyncpg SSL mode. Default `prefer` is asyncpg's own default and is what local dev and
+    # CI need — both run a plain Postgres container with `ssl = off`, which REJECTS an SSL
+    # upgrade outright (observed, not assumed). Managed providers require TLS, so deployed
+    # environments set DATABASE_SSL=require. Provider-agnostic: no endpoint is hardcoded
+    # anywhere, so direct-vs-pooled and TLS both stay pure configuration.
+    database_ssl: str = "prefer"
     redis_url: str = "redis://localhost:6379/0"
 
     # Internal app-shell <-> agent API. The app shell is the single refresh authority

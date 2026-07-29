@@ -1,0 +1,27 @@
+# Build-context exclusions for the agent image.
+#
+# Anything reachable from here can land in an image layer and stays there permanently.
+# Secrets must never enter the context at all.
+
+# Secrets. `.env` carries DATABASE_URL credentials, INTERNAL_API_KEY (the shared secret
+# with the app shell), and the engine API keys. A deployed environment supplies these as
+# real env vars — the image must never carry a copy.
+.env
+.env.*
+
+# A host virtualenv is built for the host's platform and would shadow the image's.
+.venv
+
+# Caches and build droppings.
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Shopify CLI local state (can hold local TLS keys and bundles).
+.shopify
+
+# Local infrastructure and VCS metadata.
+.git

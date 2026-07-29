@@ -93,14 +93,49 @@ export async function getAdminToken(shop: string): Promise<AdminToken> {
   // Rotation must be serialized per shop: two concurrent refreshes would invalidate each
   // other's refresh token and permanently break the chain. Callers block here rather than
   // racing. See shop-lock.server.ts.
-  return withShopRefreshLock(shop, (tx) => refreshUnderLock(tx, shop, sessionId));
+  return withShopRefreshLock(shop, (tx) =>
+    refreshUnderLock(tx, shop, sessionId, WITHIN_MILLISECONDS_OF_EXPIRY),
+  );
 }
 
-/** Must only be called while holding the shop's rotation lock. */
+/**
+ * Leave `shop`'s stored offline session valid for at least `withinMs`, refreshing it under the
+ * rotation lock if it is not.
+ *
+ * This exists so the webhook path can refresh through the SAME authority and the SAME
+ * tx-pinned critical section as `getAdminToken`, instead of letting the library refresh
+ * through its global-client session storage. Callers get no token — a webhook does not need
+ * one; it needs the stored session to be fresh before `authenticate.webhook()` reads it.
+ *
+ * A missing session is not an error here: `app/uninstalled` can arrive after the row is gone,
+ * and that webhook still has to be processed. Throws ReauthRequiredError when the chain is
+ * dead; anything else it throws is transient.
+ */
+export async function ensureFreshOfflineSession(shop: string, withinMs: number): Promise<void> {
+  const sessionId = api.session.getOfflineId(shop);
+  const session = await sessionStorage.loadSession(sessionId);
+
+  // Read outside the transaction, so the fast path holds no connection when it returns and
+  // the lock path opens its transaction with nothing else checked out.
+  if (!session || !session.isExpired(withinMs)) {
+    return;
+  }
+
+  await withShopRefreshLock(shop, (tx) => refreshUnderLock(tx, shop, sessionId, withinMs));
+}
+
+/**
+ * Must only be called while holding the shop's rotation lock.
+ *
+ * `withinMs` is the caller's staleness window. It is threaded through rather than fixed so the
+ * post-lock re-check uses the same threshold the caller decided on — a narrower re-check would
+ * let the lock winner return without refreshing a session the caller considered stale.
+ */
 async function refreshUnderLock(
   tx: Prisma.TransactionClient,
   shop: string,
   sessionId: string,
+  withinMs: number,
 ): Promise<AdminToken> {
   // Read and write through the lock's own transaction connection, never the global client.
   // The advisory lock is held for the whole transaction; if the inner I/O borrowed a second
@@ -119,7 +154,7 @@ async function refreshUnderLock(
     throw new ReauthRequiredError(`No session stored for ${shop}`);
   }
 
-  if (!session.isExpired(WITHIN_MILLISECONDS_OF_EXPIRY)) {
+  if (!session.isExpired(withinMs)) {
     return tokenOf(session);
   }
 

@@ -30,3 +30,16 @@ class WorkerSettings:
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
+
+    # Arq's default poll_delay of 0.5s costs a Redis command every half-second per worker
+    # process — ~5.2M commands/month completely idle, against a 500K/month free Upstash
+    # ceiling. That exhausts the quota in about three days of doing nothing at all. At 15s
+    # the idle floor lands near 35% of the ceiling, leaving headroom for actual work.
+    #
+    # The cost is up to 15s of latency before a queued job is picked up. Every job here is
+    # a background scan / fix / publish / verify measured in minutes, so that is invisible.
+    #
+    # This budget assumes EXACTLY ONE arq process. Never run 2 replicas: the poll cost is
+    # per-process, so a second replica doubles the idle command rate straight through the
+    # ceiling — and the jobs are keyed per shop, not sharded, so a second one buys nothing.
+    poll_delay = 15
