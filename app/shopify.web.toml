@@ -1,6 +1,6 @@
 name = "quixly"
 roles = ["frontend", "backend"]
-port = 3000
+port = 3001
 
 [commands]
 predev = "npm run setup"
