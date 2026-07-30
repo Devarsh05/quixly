@@ -103,6 +103,18 @@ the phase by which it should be revisited.
   the existing rows rather than letting them re-fork.
   _Raised: 2026-07-28 (Phase 4 step 1)._
 
+- **The uplift page's headline must become "latest settled, else latest" when weekly scans land.**
+  `app/app/routes/app.uplift.tsx` renders `runs[runs.length - 1]` — correct while one measurement
+  exists. Once **scheduled weekly scans** (the other open Phase 4 item) fire a fresh *unsettled*
+  re-measurement, that selector puts the newest run at the front and the last good **settled**
+  result disappears behind "Measurement pending". A number vanishing from the merchant's page
+  reads as a bug, not as caution. Fix: pick the latest run whose `state == "settled"`, falling back
+  to the latest of any state, and show a newer unsettled run as a secondary "re-measurement in
+  progress" note beside the standing result. **The data contract already supports this** — the
+  series carries per-run `state`, so it is a selector change in one component, not a
+  re-architecture. Do it **in the same PR as weekly scans**, not after: the two together are what
+  create the regression. _Raised: 2026-07-30 (Phase 4 uplift chart)._
+
 - **`agent_runs` still has no run-kind discriminator, and Phase 4 did not add one.** Deliberate:
   a verification run genuinely IS a scan run (it writes `engine_runs` + `share_of_model`), so a
   `kind` column would have been redundant for it. Baseline selection instead keys on

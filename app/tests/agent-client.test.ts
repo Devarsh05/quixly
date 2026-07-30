@@ -6,7 +6,13 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { getFixes, getReport, publishFixes, startScan } from "../app/lib/agent.server";
+import {
+  getFixes,
+  getReport,
+  getVerificationSeries,
+  publishFixes,
+  startScan,
+} from "../app/lib/agent.server";
 
 const AGENT_URL = "http://agent.test";
 const KEY = "test-internal-key";
@@ -161,6 +167,62 @@ describe("agent.server scan/report client", () => {
     it("throws on a non-OK, non-404 response", async () => {
       fetchMock.mockResolvedValue(new Response("", { status: 502 }));
       await expect(getReport(SHOP)).rejects.toThrow(/502/);
+    });
+  });
+
+  describe("getVerificationSeries", () => {
+    it("GETs the by-domain verifications URL with the internal key header", async () => {
+      fetchMock.mockResolvedValue(jsonResponse({ runs: [] }));
+
+      const series = await getVerificationSeries(SHOP);
+
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe(
+        `${AGENT_URL}/shops/by-domain/${encodeURIComponent(SHOP)}/verifications`,
+      );
+      expect(headerOf(init, "X-Internal-Api-Key")).toBe(KEY);
+      expect(series).toEqual({ runs: [] });
+    });
+
+    it("threads limit as a query param", async () => {
+      fetchMock.mockResolvedValue(jsonResponse({ runs: [] }));
+
+      await getVerificationSeries(SHOP, 3);
+
+      const [url] = fetchMock.mock.calls[0];
+      expect(url).toBe(
+        `${AGENT_URL}/shops/by-domain/${encodeURIComponent(SHOP)}/verifications?limit=3`,
+      );
+    });
+
+    it("returns null on 404 (the agent does not know this shop)", async () => {
+      fetchMock.mockResolvedValue(new Response("", { status: 404 }));
+      expect(await getVerificationSeries(SHOP)).toBeNull();
+    });
+
+    it("throws on a non-OK, non-404 response", async () => {
+      fetchMock.mockResolvedValue(new Response("", { status: 502 }));
+      await expect(getVerificationSeries(SHOP)).rejects.toThrow(/502/);
+    });
+
+    it("passes a null rate through untouched — never coalesced to 0", async () => {
+      // The fabricated-regression guard, asserted at the client boundary too: nothing between
+      // the agent and the component may turn "no data" into a number.
+      fetchMock.mockResolvedValue(
+        jsonResponse({
+          runs: [
+            {
+              run_id: 1,
+              engines: [{ engine: "perplexity", pre_rate: 0.5, post_rate: null, delta: null }],
+            },
+          ],
+        }),
+      );
+
+      const series = await getVerificationSeries(SHOP);
+
+      expect(series?.runs[0].engines[0].post_rate).toBeNull();
+      expect(series?.runs[0].engines[0].delta).toBeNull();
     });
   });
 });

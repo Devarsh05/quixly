@@ -22,11 +22,12 @@ byte-identical queries. Calling the builder here would silently bind a post-scan
 row after any Interrogator edit, and the delta would be confounded with nothing raised.
 """
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Annotated
 
 from arq.connections import ArqRedis, RedisSettings, create_pool
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,6 +37,13 @@ from app.db import get_db
 from app.models import AgentRun, AgentRunStatus, Shop, Verification
 from app.services.baselines import resolve_measured_set, select_baseline_run
 from app.services.runs import create_agent_run
+from app.services.uplift import (
+    EngineState,
+    RunState,
+    classify_engine,
+    classify_run,
+    deltas_reportable,
+)
 from app.settings import get_settings
 
 router = APIRouter(prefix="/shops", tags=["verify"])
@@ -76,6 +84,9 @@ class EngineDeltaView(BaseModel):
     pre_total_queries: int | None
     post_total_queries: int | None
     competitors: dict[str, CompetitorDeltaView]
+    # How to FRAME the numbers above. Computed here so the shell derives nothing — in particular
+    # so a NULL side renders as "no data" and never as 0% or a regression.
+    state: EngineState
 
 
 class VerificationResponse(BaseModel):
@@ -96,6 +107,36 @@ class VerificationResponse(BaseModel):
     measured_fixes: list[MeasuredFixView]
     engines: list[EngineDeltaView]
 
+    # --- presentation state (derived on read, never persisted) ---
+    state: RunState
+    deltas_reportable: bool
+    """False unless the run is completed, has rows AND met the settle window.
+
+    The one flag that stops an unsettled measurement being shown as a finding. Server-computed
+    rather than a comparison in the shell, because the shell's test harness has no DOM and cannot
+    assert its own rendering.
+    """
+
+    measured_at: datetime | None
+    """When the measurement was recorded (``verifications.created_at``) — the series x-axis."""
+
+    settle_hours_required: float
+    """The CURRENTLY configured settle window, for context copy only.
+
+    ``settle_satisfied`` is the persisted authority and is what display keys on; this is not
+    necessarily the threshold that was in force when the row was written.
+    """
+
+
+class VerificationSeriesResponse(BaseModel):
+    """A shop's recent verification runs, **oldest → newest** (a chart reads left to right).
+
+    The MVP renders only the last element. The series shape exists so a delta-over-time
+    trajectory is a second reader of this array rather than a contract change.
+    """
+
+    runs: list[VerificationResponse]
+
 
 async def _enqueue(
     run_id: int, baseline_run_id: int, measured_fixes: list[dict], force: bool
@@ -114,6 +155,60 @@ async def _resolve_shop(db: AsyncSession, shop_domain: str) -> Shop:
     if shop is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Shop not found.")
     return shop
+
+
+def _verification_view(
+    run: AgentRun, rows: Sequence[Verification], settle_hours_required: float
+) -> VerificationResponse:
+    """Assemble one run's view. The SINGLE assembly path, shared by both read routes.
+
+    Extracted so the single-run and series routes cannot drift — a divergence here would mean the
+    chart and the drill-down disagreed about whether a measurement was reportable.
+    """
+    # The header fields are denormalized across an engine's rows on purpose (see
+    # models/verification.py); dedup on read, never by normalizing storage.
+    first = rows[0] if rows else None
+
+    state = classify_run(
+        status=run.status,
+        has_rows=first is not None,
+        settle_satisfied=first.settle_satisfied if first else None,
+    )
+
+    return VerificationResponse(
+        run_id=run.id,
+        baseline_run_id=first.baseline_run_id if first else None,
+        status=run.status,
+        panel_fingerprint=first.panel_fingerprint if first else None,
+        published_at_max=first.published_at_max if first else None,
+        settle_hours=first.settle_hours if first else None,
+        settle_satisfied=first.settle_satisfied if first else None,
+        measured_fixes=[
+            MeasuredFixView(**fix) for fix in (first.measured_fixes_json if first else [])
+        ],
+        engines=[
+            EngineDeltaView(
+                engine=row.engine,
+                pre_rate=row.pre_rate,
+                post_rate=row.post_rate,
+                delta=row.delta,
+                pre_mentions=row.pre_mentions,
+                post_mentions=row.post_mentions,
+                pre_total_queries=row.pre_total_queries,
+                post_total_queries=row.post_total_queries,
+                competitors={
+                    name: CompetitorDeltaView(**payload)
+                    for name, payload in (row.competitor_deltas_json or {}).items()
+                },
+                state=classify_engine(pre_rate=row.pre_rate, post_rate=row.post_rate),
+            )
+            for row in rows
+        ],
+        state=state,
+        deltas_reportable=deltas_reportable(state),
+        measured_at=first.created_at if first else None,
+        settle_hours_required=settle_hours_required,
+    )
 
 
 @router.post(
@@ -259,36 +354,62 @@ async def get_verification(
         )
     ).scalars().all()
 
-    # The manifest is denormalized across an engine's rows on purpose (see models/verification.py);
-    # dedup on read, never by normalizing storage.
-    first = rows[0] if rows else None
+    return _verification_view(run, rows, get_settings().verify_settle_hours)
 
-    return VerificationResponse(
-        run_id=run_id,
-        baseline_run_id=first.baseline_run_id if first else None,
-        status=run.status,
-        panel_fingerprint=first.panel_fingerprint if first else None,
-        published_at_max=first.published_at_max if first else None,
-        settle_hours=first.settle_hours if first else None,
-        settle_satisfied=first.settle_satisfied if first else None,
-        measured_fixes=[
-            MeasuredFixView(**fix) for fix in (first.measured_fixes_json if first else [])
-        ],
-        engines=[
-            EngineDeltaView(
-                engine=row.engine,
-                pre_rate=row.pre_rate,
-                post_rate=row.post_rate,
-                delta=row.delta,
-                pre_mentions=row.pre_mentions,
-                post_mentions=row.post_mentions,
-                pre_total_queries=row.pre_total_queries,
-                post_total_queries=row.post_total_queries,
-                competitors={
-                    name: CompetitorDeltaView(**payload)
-                    for name, payload in (row.competitor_deltas_json or {}).items()
-                },
-            )
-            for row in rows
-        ],
+
+@router.get(
+    "/by-domain/{shop_domain}/verifications",
+    response_model=VerificationSeriesResponse,
+    dependencies=[Depends(require_internal_api_key)],
+)
+async def list_verifications(
+    shop_domain: str,
+    db: DbSession,
+    limit: Annotated[int, Query(ge=1, le=50)] = 12,
+) -> VerificationSeriesResponse:
+    """The shop's recent verification runs, oldest → newest. Plain read; writes nothing.
+
+    Exists because a trajectory cannot be assembled from the single-run route without N
+    round-trips. A shop with no verifications is a **normal state**, so this returns 200 with an
+    empty list (as ``api.fixes.list_fixes`` does) — 404 is reserved for an unknown shop.
+
+    Note that rows only exist *after* aggregation, so an in-flight verification does not appear
+    here at all; ``get_verification`` with an explicit ``run_id`` is the only way to observe one.
+    """
+    shop = await _resolve_shop(db, shop_domain)
+
+    run_ids = (
+        await db.execute(
+            select(Verification.run_id)
+            .where(Verification.shop_id == shop.id)
+            .group_by(Verification.run_id)
+            .order_by(Verification.run_id.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+    if not run_ids:
+        return VerificationSeriesResponse(runs=[])
+
+    rows = (
+        await db.execute(
+            select(Verification)
+            .where(Verification.run_id.in_(run_ids), Verification.shop_id == shop.id)
+            .order_by(Verification.run_id, Verification.engine)
+        )
+    ).scalars().all()
+
+    by_run: dict[int, list[Verification]] = {}
+    for row in rows:
+        by_run.setdefault(row.run_id, []).append(row)
+
+    # Ascending id is chronological (serial PK), so this hands back oldest → newest. Driving the
+    # list off the AgentRun rows keeps status resolution total: verifications.run_id CASCADEs, so
+    # a row without its run cannot exist.
+    runs = (
+        await db.execute(select(AgentRun).where(AgentRun.id.in_(run_ids)).order_by(AgentRun.id))
+    ).scalars().all()
+
+    required = get_settings().verify_settle_hours
+    return VerificationSeriesResponse(
+        runs=[_verification_view(run, by_run.get(run.id, []), required) for run in runs]
     )

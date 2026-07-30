@@ -105,6 +105,77 @@ export type FixRunStart = { run_id: number; status: string };
 
 export type FixDecision = { fix_id: number; status: string };
 
+/**
+ * How to FRAME one engine's before/after pair. Decided agent-side (`services/uplift.py`).
+ *
+ * `no_data_*` means that side had zero usable queries — it must render as "no data", NEVER as 0%
+ * and never as a regression. `no_movement` is the opposite: a real measurement that did not move.
+ */
+export type EngineState =
+  | "improved"
+  | "declined"
+  | "no_movement"
+  | "no_data_pre"
+  | "no_data_post"
+  | "no_data_both";
+
+/**
+ * How much of a verification run may be shown as a result.
+ *
+ * `unsettled` is the one that matters: the run completed and holds real numbers, but engines had
+ * not re-crawled yet, so it measured nothing. Never present it as a finding.
+ */
+export type RunState = "running" | "failed" | "empty" | "unsettled" | "settled";
+
+export type CompetitorDelta = {
+  pre_rate: number | null;
+  post_rate: number | null;
+  delta: number | null;
+};
+
+export type EngineDelta = {
+  engine: string;
+  /** null = no data on that side (never 0.0); `delta` is null if either side is. */
+  pre_rate: number | null;
+  post_rate: number | null;
+  delta: number | null;
+  pre_mentions: number | null;
+  post_mentions: number | null;
+  pre_total_queries: number | null;
+  post_total_queries: number | null;
+  competitors: Record<string, CompetitorDelta>;
+  state: EngineState;
+};
+
+/** Provenance — what was live during the measured window. NOT attribution to any one fix. */
+export type MeasuredFix = {
+  fix_id: number;
+  product_id: number;
+  type: string;
+  target: string;
+  published_at: string;
+};
+
+export type VerificationRun = {
+  run_id: number;
+  baseline_run_id: number | null;
+  status: "running" | "completed" | "failed";
+  panel_fingerprint: string | null;
+  published_at_max: string | null;
+  settle_hours: number | null;
+  settle_satisfied: boolean | null;
+  measured_fixes: MeasuredFix[];
+  engines: EngineDelta[];
+  state: RunState;
+  /** The ONLY gate on rendering a delta figure. Never re-derive this in the component. */
+  deltas_reportable: boolean;
+  measured_at: string | null;
+  settle_hours_required: number;
+};
+
+/** Oldest -> newest. The MVP renders the last element; the array is the trajectory contract. */
+export type VerificationSeries = { runs: VerificationRun[] };
+
 function agentUrl(path: string): string {
   const base = process.env.AGENT_SERVICE_URL;
   if (!base) throw new Error("AGENT_SERVICE_URL is not set");
@@ -270,4 +341,28 @@ export function decideFix(
     `/shops/by-domain/${encodeURIComponent(shopDomain)}/fixes/${fixId}/${decision}`,
     {},
   );
+}
+
+/**
+ * The shop's recent verification runs, oldest -> newest, or null if the agent does not know this
+ * shop. READ-ONLY: it renders what the Verifier already measured and triggers nothing.
+ *
+ * A known shop that has never verified returns `{ runs: [] }` (200), which is a DISTINCT case
+ * from the null above — "nothing measured yet" versus "not connected".
+ */
+export async function getVerificationSeries(
+  shopDomain: string,
+  limit?: number,
+): Promise<VerificationSeries | null> {
+  const query = limit != null ? `?limit=${limit}` : "";
+  const response = await fetch(
+    agentUrl(`/shops/by-domain/${encodeURIComponent(shopDomain)}/verifications${query}`),
+    { headers: internalHeaders() },
+  );
+
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    throw new Error(`Agent verifications returned ${response.status}`);
+  }
+  return (await response.json()) as VerificationSeries;
 }
