@@ -197,6 +197,33 @@ the phase by which it should be revisited.
   found in the process (dispatching on the REST form instead of the library-canonical
   `PRODUCTS_UPDATE`) was fixed in the same commit. _Raised: 2026-07-16; resolved: 2026-07-21._
 
+## Deployed environment (Northflank / Neon / Upstash, live 2026-07-30)
+
+- **`SHOPIFY_API_SECRET` is pinned to the OLD client secret; migrate to New deliberately.**
+  Rotating in Partners creates New *alongside* Old and **both stay active**. Shopify signs session
+  tokens with the secret the *released app version* was created under — the live version dates
+  2026-07-14, before the rotation, so it signs with **Old**. Configuring the deployed shell with New
+  produced a 401 loop with **no database error** (sessions were persisting fine), which is why the
+  app is pinned to Old. **Consequence: Old CANNOT be revoked** — the planned post-Stage-F "revoke
+  the old secret" cleanup is **cancelled** until this is done. The migration is ordered and must not
+  be shortcut: release a new app version *under* New (`shopify app deploy`) → confirm the release is
+  live → *then* swap `SHOPIFY_API_SECRET` on `quixly-app`. Swapping first reproduces the 401 loop.
+  _Raised: 2026-07-30 (Phase 0 deploy, Stages B–F)._
+
+- **Rotate the local Postgres password.** Stage A's leak baked local DB credentials into an image
+  layer, and a layer keeps what it was given permanently. Confirmed **local-only — never pushed to
+  any registry** — so this is hygiene, not exposure, and low urgency. The production credentials are
+  unaffected (Neon was provisioned fresh, and `INTERNAL_API_KEY` was rotated to a new production
+  value at deploy). _Raised: 2026-07-30 (carried from Stage A)._
+
+- **Delete `D:\quixly-deploy-secrets.txt`** once every value in it is confirmed present in
+  Northflank. Plaintext secrets on the workstation, no longer needed after provisioning.
+  _Raised: 2026-07-30._
+
+- **CLOSED (2026-07-30): `host-key.pem` needs no rotation.** It was a transient Shopify-CLI/ngrok
+  artifact, never committed to the tree, and already excluded by `app/.dockerignore` (the `.shopify`
+  exclusion added in Stage A). Recorded so it is not re-raised. _Raised and closed: 2026-07-30._
+
 ## Compliance
 
 - **Mandatory compliance webhooks are still commented out.** `customers/data_request`,

@@ -11,7 +11,47 @@ uplift. Full spec: see `PRD.md` (read it before large changes).
   simulation, diagnosis, grounded optimization, publishing, verification. Async workers here.
 - Postgres (+ pgvector) = primary store. Redis = queue/locks. Browserbase = browser sims.
 - App shell ↔ agent service over an internal authenticated API. Agent also exposes an MCP server.
-- Deploy: Railway (both services + Postgres + Redis).
+- Deploy: **Northflank** (both services) + **Neon** Postgres + **Upstash** Redis — live since
+  2026-07-30. (PRD §15 says Railway; superseded.) Durable constraints below.
+
+## Deployed environment (live 2026-07-30 — constraints, not narrative)
+Narrative and the bugs that produced these rules: `docs/session-log/2026-07-30-phase-0-deploy-live.md`.
+- **Service names are the reverse of what you expect.** Northflank project `quixly`:
+  service **`quixly` = the AGENT** (uvicorn + arq, port 8000, private, internal DNS `quixly:8000`);
+  service **`quixly-app` = the APP SHELL** (port 3000, public,
+  `https://p01--quixly-app--5x5p4hmrvgxk.code.run`). So: app's `AGENT_SERVICE_URL=http://quixly:8000`,
+  agent's `APP_SHELL_URL=http://quixly-app:3000`. Both were wrong on first deploy. A wrong internal
+  hostname surfaces as `TokenFetchError` / "Could not reach the app shell" — **it looks like a
+  token-custody bug, not a DNS one.** Check the hostname first.
+- **`replicas = 1` on BOTH services.** Agent-side it is load-bearing: `poll_delay = 15` sizes arq's
+  idle Redis rate against a 500K/month ceiling and that cost is per-process. Jobs are keyed per
+  shop, not sharded — a second replica buys nothing.
+- **One database, two endpoints — the split is per-tool and mandatory.**
+  - **App (Prisma) → POOLED Neon host (`-pooler`), and `pgbouncer=true` is REQUIRED**:
+    `?schema=shopify&sslmode=require&pgbouncer=true&connection_limit=10&pool_timeout=3`.
+    Without it, Prisma **reads work and session WRITES fail silently** on PgBouncer → an OAuth
+    **401 loop with no DB error**.
+  - **Agent (asyncpg/Alembic) → DIRECT Neon host (no `-pooler`), `+asyncpg`, NO query params.**
+    TLS via **`DATABASE_SSL=require` + `PGSSLMODE=require`** (`sslmode=` breaks asyncpg, `ssl=`
+    breaks psycopg, and `env.py` copies the query string across on the `+psycopg` swap). Defaults
+    are `prefer` for local/CI; setting both to `require` is a provisioning step. `psycopg` (v3)
+    must be installed for Alembic's sync leg.
+- **TWO Shopify client secrets are active, and the app is pinned to the OLD one.** Rotating in
+  Partners creates New *alongside* Old; Shopify signs session tokens with the secret the *released
+  app version* was created under — which is Old. `SHOPIFY_API_SECRET` on `quixly-app` = **Old**.
+  **Never revoke Old** — auth depends on it. Migrating to New is a separate ordered task (release
+  a version under New, confirm, *then* swap the env var); see `docs/backlog.md`.
+- **URLs are toml-managed, pushed by `shopify app deploy`.** For a managed-installation app the
+  Partners dashboard does not expose `application_url` / `redirect_urls` as editable fields.
+  Callback is **`/auth/callback`** (`authPathPrefix = /auth`), never the template's `/api/auth`.
+  `SHOPIFY_APP_URL` must equal `application_url`. A URL-only release triggers no consent prompt.
+- **`pgvector` is available on Neon but NOT enabled** (no vector column exists). Enable it in an
+  Alembic migration when one is needed — never by hand in `psql` or the web SQL editor.
+- **Campus/York network blocks outbound 5432**, so direct `psql`/`prisma`/`alembic` to Neon from
+  the workstation fails with `P1001`. Use a phone hotspot or Neon's web SQL Editor (HTTPS). Also:
+  a stale `$env:DATABASE_URL` in a PowerShell session silently overrides `.env` and breaks Alembic.
+- `INTERNAL_API_KEY` is byte-identical on both services and was rotated to a fresh production
+  value at deploy (the Stage A image had baked the old one into a layer).
 
 ## Commands
 - Infra (both services): `docker compose up -d` (Postgres + Redis)
@@ -499,11 +539,23 @@ they **break the chain and force the merchant to reinstall**.
 Phase tree from `PRD.md` §15; step status is evidence-based (merged PRs + `docs/session-log/`).
 Only items confirmed by committed code or a session log are checked.
 
-### Phase 0 — Scaffold — complete (deploy deferred)
+### Phase 0 — Scaffold — complete (deploy included)
 - [x] Monorepo: `app/` (Shopify React Router template) + `agent/` (FastAPI) independently runnable
 - [x] Local infra: docker-compose Postgres (pgvector) + Redis, Alembic bootstrap, `.env.example` both sides
 - [x] CI: lint + boot check both services (agent `pytest` / ruff, app `npm run build`)
-- [ ] Railway deploy — deferred; local-only dev through Phase 4, required before Phase 5 (Ship). PRD §15 lists it under Phase 0, so it stays visible: "Phase 0 complete" does NOT mean a deployed environment exists
+- [x] Containerisation (Stage A, 2026-07-29) — both Dockerfiles, `.dockerignore` secret boundary
+      verified by scanning decompressed layer blobs, agent entrypoint (`alembic upgrade head` once,
+      then `wait -n`), per-driver TLS, `poll_delay = 15`.
+      Evidence: `docs/session-log/2026-07-29-phase-0-deploy-stage-a.md`
+- [x] **Deploy — LIVE 2026-07-30** (Stages B–F). Northflank (`quixly` = agent, `quixly-app` = shell)
+      + Neon Postgres (`production` branch) + Upstash Redis; URL cutover via `shopify.app.toml` +
+      `shopify app deploy`, no scope change and no consent prompt. **Live-verified end-to-end:**
+      one offline `shopify.Session` row on Neon (`has_token = t`), agent→shell
+      `POST /internal/shops/…/admin-token` → 200, `ingest_runs` completed, `public.products` = 20.
+      Three configuration traps cost the session — service naming, `pgbouncer=true`, two active
+      Shopify secrets — all now in "Deployed environment".
+      Evidence: `docs/session-log/2026-07-30-phase-0-deploy-live.md`
+      (PRD §15 says Railway; Northflank is the actual provider.)
 
 ### Phase 1 — Connect — complete
 - [x] Shopify OAuth + embedded app loads in the dev store (`quixly-ljymkoyb.myshopify.com`)
@@ -582,7 +634,16 @@ Only items confirmed by committed code or a session log are checked.
 - [ ] App Store submission (incl. compliance webhooks `customers/data_request`/`redact`, `shop/redact`)
 - [ ] MCP server
 
-**Next action:** Phase 3 is complete end-to-end — the Optimizer proposes, the gate approves, and the
+**Next action:** **Phase 0's deploy is COMPLETE and the stack is live (2026-07-30)** — Northflank +
+Neon + Upstash, verified by a real 20/20 catalog ingest through the hosted services. Its durable
+constraints are in "Deployed environment"; the three configuration traps that produced them are in
+`docs/session-log/2026-07-30-phase-0-deploy-live.md`. Two follow-ups carry forward:
+- **`SHOPIFY_API_SECRET` is pinned to the OLD secret and Old must NOT be revoked.** Migrating to New
+  is a separate ordered task (release under New → confirm → swap) — see `docs/backlog.md`.
+- **`app/shopify.app.toml` (the URL cutover) is released to Shopify but not yet committed.** Commit
+  it, or a fresh clone re-releases the placeholder URL.
+
+Phase 3 is complete end-to-end — the Optimizer proposes, the gate approves, and the
 Publisher writes to a live store and verifies by re-reading (steps 2b–4, all live-verified on
 `quixly-ljymkoyb`). Two things carry forward rather than being finished:
 - the **taxonomy metafield** write path stays deferred behind `read_metaobject_definitions` (a third
@@ -594,7 +655,10 @@ landed 2026-07-29 (run **2787** against baseline **137**, `force=true`, one veri
 `delta = 0.0` at 12.6h elapsed). Two things carry forward:
 - **The settled re-measurement is due 2026-08-04**, when the 168h window is met. Run it **without**
   `force` — it must land `settle_satisfied = true`, and it is the first run that can show real
-  movement (at 12.6h no engine had re-crawled, so `delta = 0.0` measured nothing).
+  movement (at 12.6h no engine had re-crawled, so `delta = 0.0` measured nothing). It now runs
+  **against the deployed environment**, not local: the invocation point moves, the semantics do not
+  — the panel, baseline run 137 and the measured set are properties of the shared database, which
+  is the same database migrated to Neon.
 - The **empty-measured-set 409** is the one branch left **test-covered but not live-exercised**
   (`tests/test_verify_route.py:151`): `shops` holds exactly one row, so probing it live would mean
   fabricating a shop. Close it whenever a second shop exists.
@@ -608,8 +672,8 @@ aggregates rather than the baseline's twice.
 
 After that: the uplift chart, scheduled weekly scans (which also keep the refresh chain warm), and
 Browserbase simulation. Read channel membership via `product.resourcePublications` and **never** by
-enumerating `publications` or gating on a count field (see Conventions). Phase 0's Railway deploy is
-still outstanding and is required before Phase 5.
+enumerating `publications` or gating on a count field (see Conventions). Phase 0's deploy is no
+longer a Phase-5 blocker — it landed 2026-07-30.
 
 ## Session Log
 
