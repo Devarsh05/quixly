@@ -2,21 +2,22 @@
 
 client_id = "8ad730c2c915afc9e7dcae3ee071f7e0"
 name = "quixly"
-application_url = "https://shopify.dev/apps/default-app-home"
+application_url = "https://p01--quixly-app--5x5p4hmrvgxk.code.run"
 embedded = true
 
 [build]
-automatically_update_urls_on_dev = true
+automatically_update_urls_on_dev = false
+
 [webhooks]
 api_version = "2026-07"
 
   [[webhooks.subscriptions]]
-  uri = "/webhooks/products/update"
-  topics = [ "products/update" ]
-
-  [[webhooks.subscriptions]]
   uri = "/webhooks/app/scopes_update"
   topics = [ "app/scopes_update" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/products/update"
+  topics = [ "products/update" ]
 
   [[webhooks.subscriptions]]
   uri = "/webhooks/app/uninstalled"
@@ -43,4 +44,4 @@ api_version = "2026-07"
 scopes = "write_products,read_metaobjects,read_publications"
 
 [auth]
-redirect_urls = [ "https://shopify.dev/apps/default-app-home/api/auth" ]
+redirect_urls = [ "https://p01--quixly-app--5x5p4hmrvgxk.code.run/auth/callback" ]

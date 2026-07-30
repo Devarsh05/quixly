@@ -235,8 +235,18 @@ observations, not on the UI's success banner alone:
 
 ## Working-tree note
 
-`app/shopify.app.toml` carries the Stage E cutover (`application_url`, `redirect_urls`,
-`automatically_update_urls_on_dev`) and is **left uncommitted** by instruction — this session was
-scoped to docs. It is already released to Shopify via `shopify app deploy`, so the deployed
-reality is ahead of the committed tree until that file is committed. **Commit it next**;
-leaving it dirty means a fresh clone re-releases the placeholder URL.
+`app/shopify.app.toml` carries the Stage E cutover and is **committed** — separately from the docs,
+in the follow-up commit to this log. Three changes: `application_url` and `redirect_urls` to the
+`.code.run` host (with the callback path corrected from the template's `/api/auth` to the real
+`/auth/callback`), and `automatically_update_urls_on_dev = false`.
+
+It matters that this file is committed rather than left dirty: it is the **source of truth for the
+released URLs**, so a fresh clone with the old contents would re-release the
+`shopify.dev/apps/default-app-home` placeholder on the next `shopify app deploy` and break OAuth
+for the live app.
+
+**Consequence of `automatically_update_urls_on_dev = false`, worth knowing before the next dev
+session:** `shopify app dev` will no longer rewrite `application_url` to the tunnel. Local dev
+against live webhooks now needs the ngrok URL passed explicitly (`--tunnel-url=…`, per Commands in
+`CLAUDE.md`) and a deliberate deploy to point Shopify back at the tunnel — the flag protects the
+deployed URL from a dev run, in exchange for making the dev path manual.

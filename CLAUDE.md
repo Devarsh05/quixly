@@ -45,6 +45,9 @@ Narrative and the bugs that produced these rules: `docs/session-log/2026-07-30-p
   Partners dashboard does not expose `application_url` / `redirect_urls` as editable fields.
   Callback is **`/auth/callback`** (`authPathPrefix = /auth`), never the template's `/api/auth`.
   `SHOPIFY_APP_URL` must equal `application_url`. A URL-only release triggers no consent prompt.
+  **`automatically_update_urls_on_dev = false`** so a `shopify app dev` run cannot stomp the
+  deployed URL — the cost is that local dev against live webhooks needs `--tunnel-url` and a
+  deliberate deploy to point Shopify back at the tunnel (see Commands).
 - **`pgvector` is available on Neon but NOT enabled** (no vector column exists). Enable it in an
   Alembic migration when one is needed — never by hand in `psql` or the web SQL editor.
 - **Campus/York network blocks outbound 5432**, so direct `psql`/`prisma`/`alembic` to Neon from
@@ -637,11 +640,9 @@ Only items confirmed by committed code or a session log are checked.
 **Next action:** **Phase 0's deploy is COMPLETE and the stack is live (2026-07-30)** — Northflank +
 Neon + Upstash, verified by a real 20/20 catalog ingest through the hosted services. Its durable
 constraints are in "Deployed environment"; the three configuration traps that produced them are in
-`docs/session-log/2026-07-30-phase-0-deploy-live.md`. Two follow-ups carry forward:
+`docs/session-log/2026-07-30-phase-0-deploy-live.md`. One follow-up carries forward:
 - **`SHOPIFY_API_SECRET` is pinned to the OLD secret and Old must NOT be revoked.** Migrating to New
   is a separate ordered task (release under New → confirm → swap) — see `docs/backlog.md`.
-- **`app/shopify.app.toml` (the URL cutover) is released to Shopify but not yet committed.** Commit
-  it, or a fresh clone re-releases the placeholder URL.
 
 Phase 3 is complete end-to-end — the Optimizer proposes, the gate approves, and the
 Publisher writes to a live store and verifies by re-reading (steps 2b–4, all live-verified on
