@@ -467,6 +467,41 @@ they **break the chain and force the merchant to reinstall**.
     readback it must use `product.resourcePublications` and must NOT gate on
     `resourcePublicationsCount` (see the channel-discovery convention above; this bites the
     Verifier hardest). Browserbase ground-truth simulation is a separate Phase 4 item.
+- **Uplift presentation — display state is DERIVED AGENT-SIDE, and never keyed on the delta.**
+  `agent/app/services/uplift.py` is pure (no DB, no I/O) and is the single definition; the shell
+  (`app/app/routes/app.uplift.tsx`) is a switch over what it returns. **This split is not style —
+  it is testability.** The app's vitest config is `environment: "node"` with
+  `include: ["tests/**/*.test.ts"]`: there is no DOM and `.tsx` is not even matched, so display
+  logic living in the component is logic nothing checks.
+  - **`deltas_reportable` is the one gate on showing a delta figure, and it means
+    `status == "completed"` AND rows exist AND `settle_satisfied`.** Run 2787 is the reason: it
+    holds `delta = 0.0` with `settle_satisfied = false`, so keying display on the *value* renders
+    "0% uplift, your fixes did nothing" for a run that measured nothing (12.6h of a 168h window,
+    no engine had re-crawled). Unsettled shows the rates as a labelled *reading* with **no delta
+    and no chart** — proven by rendering, not asserted by intent
+    (`app/tests/app.uplift.render.test.ts`).
+  - **`classify_run` is an ALLOWLIST on `completed`, not a fall-through.** `agent_runs.status` is
+    a plain `String(32)` (not a DB enum) and its model docstring says adding a status is a
+    code-only change — so *"not running and not failed, therefore settled"* would silently promote
+    a future `queued` into a reportable result. Unknown → `empty`. Fail closed.
+  - **NULL is a state, never a number.** A side with `total_queries = 0` arrives NULL and gets
+    `no_data_pre/post/both`; it renders "no data this period", **never 0% and never a decline**.
+    No `coalesce`, no `?? 0`, anywhere in the read path or the component — a coalesce here shows
+    the merchant a *fabricated regression* for what was only a flaky engine. Distinct from
+    `no_movement`, which is a settled `delta = 0.0` with real queries on both sides — a genuine
+    finding. The component guards on the raw rates too, not only on `state`, so an unrecognised
+    state degrades to "no data" rather than printing `NaN`.
+  - **Copy is observational: "recommendation rate — before X%, after Y%".** `measured_fixes_json`
+    is provenance ("measured after N fixes went live"), never attribution — the grain is
+    `(run_id, engine)` and no number belongs to an individual fix.
+  - **The page is read-only and does NOT poll.** Verification rows are written only at aggregation
+    time, so an in-flight run never appears in the series — there is no in-flight state to watch,
+    unlike the audit/fixes pages which poll a run they started. It also exports no `action`:
+    nothing on this page can trigger a measurement.
+  - The series route returns runs **oldest → newest** so a trajectory is a later second reader of
+    the same array. Today the shell renders `runs[last]`; **when weekly scans land that selector
+    must become "latest settled, else latest"** or a fresh unsettled scan hides the standing
+    result — see `docs/backlog.md`.
 - **One node→row mapping.** `services.catalog.product_row_from_node` is shared by the ingest job and
   the Publisher's re-read, so the Publisher hashes exactly what ingest stored. Don't add a second.
 - **Approval gate (step 3) — the invariants the Publisher must not break.** `agent/app/api/fixes.py`
@@ -627,7 +662,13 @@ Only items confirmed by committed code or a session log are checked.
       enumeration hides the channel (see Conventions). Evidence: `2c-write-target.md` L7.
       (L5 — whether non-mapped `custom.*` reaches Catalog — remains unresolved and needs a live
       agentic query; moot since `custom.*` is retired)
-- [ ] Uplift chart
+- [x] **Uplift chart — Phase 4 step 2.** Read-only merchant surface over `verifications`:
+      `agent/app/services/uplift.py` (pure state matrix) + two additive fields on the existing
+      `GET .../verification` + a new `GET .../verifications` series route, rendered by
+      `app/app/routes/app.uplift.tsx`. No schema change, no Shopify call, no write, no polling.
+      Presentation invariants in Conventions. Verified by rendering run 2787's exact row shape:
+      it comes out "Measurement pending", with no delta figure and no chart
+      (`app/tests/app.uplift.render.test.ts`)
 - [ ] Scheduled weekly scans (also keep the refresh chain warm)
 - [ ] Browserbase shopping-agent simulation
 
@@ -671,8 +712,14 @@ a delta hold the same headline value, **provenance is only provable from a secon
 moved** — here the competitor rates, which is what proved the Verifier read the post run's own
 aggregates rather than the baseline's twice.
 
-After that: the uplift chart, scheduled weekly scans (which also keep the refresh chain warm), and
-Browserbase simulation. Read channel membership via `product.resourcePublications` and **never** by
+**Phase 4 Step 2 (the uplift chart) landed 2026-07-30** — read-only, no schema change, no Shopify
+call. Run 2787 renders as "Measurement pending" rather than 0% uplift, verified by rendering its
+exact row shape. Its invariants are in Conventions. One thing carries forward: **the headline
+selector (`runs[last]`) must become "latest settled, else latest" in the same PR as weekly scans**,
+or the first scheduled re-measurement hides the standing result — see `docs/backlog.md`.
+
+After that: scheduled weekly scans (which also keep the refresh chain warm) and Browserbase
+simulation. Read channel membership via `product.resourcePublications` and **never** by
 enumerating `publications` or gating on a count field (see Conventions). Phase 0's deploy is no
 longer a Phase-5 blocker — it landed 2026-07-30.
 

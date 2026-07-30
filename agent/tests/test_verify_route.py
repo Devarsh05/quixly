@@ -392,3 +392,130 @@ async def test_get_verification_is_run_scoped(client, db, shop, panel_id):
 async def test_get_verification_404s_when_none_exists(client, shop):
     response = await client.get(f"/shops/by-domain/{SHOP}/verification", headers=HEADERS)
     assert response.status_code == 404
+
+
+# --- presentation state (the uplift chart's contract) ------------------------------------------
+
+
+async def test_unsettled_run_is_not_reportable_however_its_delta_reads(client, db, shop, panel_id):
+    """Run 2787's exact shape: delta 0.0 at 12.6h of a 168h window.
+
+    The acceptance case for the chart. It measured nothing, so it must never reach the merchant
+    as "0% uplift" — and the flag that stops that is `deltas_reportable`, not the delta's value.
+    """
+    await _seed_verification(
+        db, shop.id, panel_id,
+        pre_rate=0.0, post_rate=0.0, delta=0.0,
+        pre_total_queries=24, post_total_queries=24,
+        settle_hours=12.60675095388889, settle_satisfied=False,
+    )
+
+    body = (await client.get(f"/shops/by-domain/{SHOP}/verification", headers=HEADERS)).json()
+
+    assert body["state"] == "unsettled"
+    assert body["deltas_reportable"] is False
+    assert body["settle_hours"] == pytest.approx(12.6067509)
+    assert body["settle_hours_required"] == 168.0
+    assert body["measured_at"] is not None
+
+
+async def test_settled_zero_delta_is_no_movement_not_no_data(client, db, shop, panel_id):
+    """A real "nothing changed" finding, distinct from a flaky engine."""
+    await _seed_verification(
+        db, shop.id, panel_id,
+        pre_rate=0.25, post_rate=0.25, delta=0.0,
+        pre_total_queries=24, post_total_queries=24,
+        settle_satisfied=True,
+    )
+
+    body = (await client.get(f"/shops/by-domain/{SHOP}/verification", headers=HEADERS)).json()
+
+    assert body["state"] == "settled"
+    assert body["deltas_reportable"] is True
+    assert body["engines"][0]["state"] == "no_movement"
+
+
+async def test_a_null_side_states_no_data_and_stays_null_on_the_wire(client, db, shop, panel_id):
+    """Guards the fabricated regression: NULL must survive serialization as `null`, not `0`."""
+    await _seed_verification(
+        db, shop.id, panel_id,
+        pre_rate=0.5, post_rate=None, delta=None, post_total_queries=0,
+    )
+
+    response = await client.get(f"/shops/by-domain/{SHOP}/verification", headers=HEADERS)
+    engine = response.json()["engines"][0]
+
+    assert engine["state"] == "no_data_post"
+    assert engine["post_rate"] is None
+    assert engine["delta"] is None
+    # Belt and braces on the raw bytes — a coalesce upstream would show up as 0.0 here.
+    assert '"post_rate":null' in response.text
+    assert '"delta":null' in response.text
+
+
+# --- the series route --------------------------------------------------------------------------
+
+
+async def test_series_requires_the_internal_key(client, shop):
+    assert (await client.get(f"/shops/by-domain/{SHOP}/verifications")).status_code == 401
+
+
+async def test_series_unknown_shop_is_404(client):
+    response = await client.get(
+        "/shops/by-domain/nope.myshopify.com/verifications", headers=HEADERS
+    )
+    assert response.status_code == 404
+
+
+async def test_series_is_empty_not_404_for_a_shop_with_no_verifications(client, shop):
+    """A shop with nothing to show is a normal state, not an error (cf. api.fixes.list_fixes)."""
+    response = await client.get(f"/shops/by-domain/{SHOP}/verifications", headers=HEADERS)
+
+    assert response.status_code == 200
+    assert response.json() == {"runs": []}
+
+
+async def test_series_is_ordered_oldest_to_newest(client, db, shop, panel_id):
+    """A chart reads left to right, so the trajectory must arrive in chronological order."""
+    older = await _seed_verification(db, shop.id, panel_id, delta=0.1)
+    newer = await _seed_verification(db, shop.id, panel_id, delta=0.4)
+
+    body = (await client.get(f"/shops/by-domain/{SHOP}/verifications", headers=HEADERS)).json()
+
+    assert [run["run_id"] for run in body["runs"]] == [older.run_id, newer.run_id]
+    assert [run["engines"][0]["delta"] for run in body["runs"]] == [0.1, 0.4]
+
+
+async def test_series_limit_keeps_the_newest_runs(client, db, shop, panel_id):
+    await _seed_verification(db, shop.id, panel_id, delta=0.1)
+    second = await _seed_verification(db, shop.id, panel_id, delta=0.2)
+    third = await _seed_verification(db, shop.id, panel_id, delta=0.3)
+
+    body = (
+        await client.get(f"/shops/by-domain/{SHOP}/verifications?limit=2", headers=HEADERS)
+    ).json()
+
+    assert [run["run_id"] for run in body["runs"]] == [second.run_id, third.run_id]
+
+
+async def test_series_excludes_another_shops_verifications(client, db, shop, panel_id):
+    other = Shop(shop_domain="other-verify-series.myshopify.com", status=ShopStatus.active)
+    db.add(other)
+    await db.commit()
+    await db.refresh(other)
+    await _seed_verification(db, other.id, panel_id, delta=0.9)
+    mine = await _seed_verification(db, shop.id, panel_id, delta=0.1)
+
+    body = (await client.get(f"/shops/by-domain/{SHOP}/verifications", headers=HEADERS)).json()
+
+    assert [run["run_id"] for run in body["runs"]] == [mine.run_id]
+
+
+async def test_series_carries_the_same_state_as_the_single_run_route(client, db, shop, panel_id):
+    """Both routes assemble through one helper; this is the guard against them drifting."""
+    await _seed_verification(db, shop.id, panel_id, settle_satisfied=False, settle_hours=12.6)
+
+    single = (await client.get(f"/shops/by-domain/{SHOP}/verification", headers=HEADERS)).json()
+    series = (await client.get(f"/shops/by-domain/{SHOP}/verifications", headers=HEADERS)).json()
+
+    assert series["runs"][-1] == single
