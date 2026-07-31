@@ -23,6 +23,31 @@ api_version = "2026-07"
   uri = "/webhooks/app/uninstalled"
   topics = [ "app/uninstalled" ]
 
+  # Shopify's three MANDATORY compliance webhooks (privacy law). Required for App Store
+  # submission: the automated review sends test payloads — including one with a deliberately
+  # invalid HMAC, which must be answered 401 — and rejects the app if any endpoint misbehaves.
+  #
+  # `compliance_topics`, not `topics`: these are declared separately from ordinary subscriptions.
+  # (The older `[webhooks.privacy_compliance]` block with `customer_data_request_url` /
+  # `customer_deletion_url` / `shop_deletion_url` is the superseded CLI schema.)
+  #
+  # Relative `uri`s, like the three subscriptions above: the CLI resolves them against
+  # `application_url`, so the submitted config points at the deployed shell with no hardcoded
+  # host, and a future URL cutover moves all six at once. This block declares webhook URLs only —
+  # it touches no scope, so it triggers NO merchant re-consent.
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/customers/data_request"
+  compliance_topics = [ "customers/data_request" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/customers/redact"
+  compliance_topics = [ "customers/redact" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/shop/redact"
+  compliance_topics = [ "shop/redact" ]
+
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 # The settled scope set for the taxonomy write path (Phase 3, step 2c spike + step 4).

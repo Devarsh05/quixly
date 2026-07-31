@@ -22,6 +22,7 @@ import httpx
 import pytest
 from sqlalchemy import select
 
+from app.api import webhooks as webhooks_api
 from app.db import get_db
 from app.main import app
 from app.models import Product, Shop, ShopStatus
@@ -180,3 +181,63 @@ async def test_products_update_unknown_status_keeps_prior_value(client, db, shop
     assert product.title == "New title"
     assert product.gtin == "0123456789012"
     assert product.updated_at > SEEDED_AT
+
+
+# --- shop/redact: dispatch only; the erasure itself is covered in test_purge_shop ------------
+
+
+@pytest.fixture
+def enqueued(monkeypatch) -> list[str]:
+    """Capture what the dispatcher queues instead of reaching for a real arq pool."""
+    calls: list[str] = []
+
+    async def fake_enqueue(shop_domain: str) -> None:
+        calls.append(shop_domain)
+
+    monkeypatch.setattr(webhooks_api, "_enqueue_purge", fake_enqueue)
+    return calls
+
+
+# "SHOP_REDACT" is what the shell forwards; "shop/redact" is the REST-header form. A dispatcher
+# that matched only one of these would return a green 204 having queued nothing — which is exactly
+# how every forwarded webhook silently no-op'd once before.
+@pytest.mark.parametrize("topic", ["SHOP_REDACT", "shop/redact"])
+async def test_shop_redact_queues_the_purge(client, shop, enqueued, topic):
+    response = await client.post("/webhooks/shopify", json=_envelope(topic), headers=HEADERS)
+
+    assert response.status_code == 204
+    assert enqueued == [SHOP]
+
+
+async def test_shop_redact_does_not_delete_inline(client, db, shop, enqueued):
+    """The route must only ENQUEUE. Deleting here would block Shopify's 5s window on a cascade."""
+    response = await client.post(
+        "/webhooks/shopify", json=_envelope("SHOP_REDACT"), headers=HEADERS
+    )
+
+    assert response.status_code == 204
+    # The shop is still here; the worker erases it, not the request.
+    assert await _status(db) == ShopStatus.active
+
+
+async def test_shop_redact_for_an_unknown_shop_still_queues(client, enqueued):
+    """No shop row is needed to accept the request — the job decides what to do about that."""
+    envelope = {"topic": "SHOP_REDACT", "shop_domain": "never-seen.myshopify.com", "payload": {}}
+
+    response = await client.post("/webhooks/shopify", json=envelope, headers=HEADERS)
+
+    assert response.status_code == 204
+    assert enqueued == ["never-seen.myshopify.com"]
+
+
+@pytest.mark.parametrize("topic", ["CUSTOMERS_REDACT", "CUSTOMERS_DATA_REQUEST"])
+async def test_customer_compliance_topics_never_reach_the_agent(client, shop, enqueued, topic):
+    """Both are answered entirely in the app shell — the agent stores no end-customer data.
+
+    If one ever arrives here it falls through to the unhandled-topic branch, and this asserts it
+    queues nothing rather than being quietly treated as a shop purge.
+    """
+    response = await client.post("/webhooks/shopify", json=_envelope(topic), headers=HEADERS)
+
+    assert response.status_code == 204
+    assert enqueued == []

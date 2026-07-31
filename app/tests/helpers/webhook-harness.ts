@@ -133,18 +133,21 @@ export function makeSession({
 
 /**
  * A webhook POST signed exactly the way Shopify signs one: base64 HMAC-SHA256 of the raw
- * body under the app secret. Pass `hmac` to forge it.
+ * body under the app secret. Pass `hmac` to forge it, or `omitHmac` to drop the header —
+ * the library treats those as two DIFFERENT rejections (401 vs 400), so the tests need both.
  */
 export function signedWebhookRequest({
   shop,
   topic = "products/update",
   payload = { id: 113 },
   hmac,
+  omitHmac = false,
 }: {
   shop?: string;
   topic?: string;
   payload?: unknown;
   hmac?: string;
+  omitHmac?: boolean;
 }): Request {
   const rawBody = JSON.stringify(payload);
   const signature =
@@ -152,11 +155,13 @@ export function signedWebhookRequest({
 
   const headers = new Headers({
     "Content-Type": "application/json",
-    "X-Shopify-Hmac-Sha256": signature,
     "X-Shopify-Topic": topic,
     "X-Shopify-Api-Version": "2026-07",
     "X-Shopify-Webhook-Id": "webhook-harness-delivery",
   });
+  if (!omitHmac) {
+    headers.set("X-Shopify-Hmac-Sha256", signature);
+  }
   if (shop) {
     headers.set("X-Shopify-Shop-Domain", shop);
   }

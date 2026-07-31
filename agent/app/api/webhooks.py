@@ -9,6 +9,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
+from arq.connections import ArqRedis, RedisSettings, create_pool
 from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel
 from sqlalchemy import select, update
@@ -19,6 +20,7 @@ from app.db import get_db
 from app.models import Product, Shop, ShopStatus
 from app.services.catalog import extract_gtin, normalize_visibility_state
 from app.services.token_provider import TokenProvider
+from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +62,33 @@ async def handle_shopify_webhook(
         await _handle_uninstalled(db, envelope.shop_domain)
     elif topic == "PRODUCTS_UPDATE":
         await _handle_product_update(db, envelope.shop_domain, envelope.payload)
+    elif topic == "SHOP_REDACT":
+        await _handle_shop_redact(envelope.shop_domain)
     else:
         logger.info("Ignoring unhandled webhook topic %s", envelope.topic)
+
+
+async def _enqueue_purge(shop_domain: str) -> None:
+    pool: ArqRedis = await create_pool(RedisSettings.from_dsn(get_settings().redis_url))
+    try:
+        await pool.enqueue_job("purge_shop", shop_domain)
+    finally:
+        await pool.aclose()
+
+
+async def _handle_shop_redact(shop_domain: str) -> None:
+    """Queue the GDPR shop purge (Shopify's mandatory ``shop/redact``).
+
+    Enqueue-and-return, never an inline delete: the app shell is holding a Shopify webhook
+    request open waiting for this, and Shopify wants a 2xx in seconds. The erasure itself is
+    ``jobs.purge_shop`` -> ``services.purge``, which is also where the reinstall guard lives.
+
+    The other two mandatory topics never reach here. ``customers/data_request`` and
+    ``customers/redact`` are answered entirely in the app shell, because the agent stores no
+    end-customer personal data for either to act on — see the handler comments there.
+    """
+    await _enqueue_purge(shop_domain)
+    logger.info("shop/redact for %s queued for purge", shop_domain)
 
 
 async def _handle_uninstalled(db: AsyncSession, shop_domain: str) -> None:
