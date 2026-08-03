@@ -176,6 +176,22 @@ export type VerificationRun = {
 /** Oldest -> newest. The MVP renders the last element; the array is the trajectory contract. */
 export type VerificationSeries = { runs: VerificationRun[] };
 
+/**
+ * A non-2xx from the agent, carrying the status so callers can tell a merchant-meaningful
+ * refusal (409 — already decided, or a type the gate will not approve) from a transient
+ * failure. The message deliberately embeds the internal agent path for the server log, so it
+ * is NEVER rendered to a merchant — surface `status`, not `message`.
+ */
+export class AgentError extends Error {
+  constructor(
+    readonly status: number,
+    path: string,
+  ) {
+    super(`Agent ${path} returned ${status}`);
+    this.name = "AgentError";
+  }
+}
+
 function agentUrl(path: string): string {
   const base = process.env.AGENT_SERVICE_URL;
   if (!base) throw new Error("AGENT_SERVICE_URL is not set");
@@ -196,7 +212,7 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   });
 
   if (!response.ok) {
-    throw new Error(`Agent ${path} returned ${response.status}`);
+    throw new AgentError(response.status, path);
   }
 
   return response.status === 204 ? (undefined as T) : ((await response.json()) as T);

@@ -19,7 +19,20 @@ const decideFix = vi.fn();
 const publishFixes = vi.fn();
 const authenticateAdmin = vi.fn();
 
+// AgentError is a real class, not a stub: the action branches on `instanceof`, so a mock that
+// replaced it would let a broken branch pass.
+class AgentError extends Error {
+  constructor(
+    readonly status: number,
+    path: string,
+  ) {
+    super(`Agent ${path} returned ${status}`);
+    this.name = "AgentError";
+  }
+}
+
 vi.mock("../app/lib/agent.server", () => ({
+  AgentError,
   getFixes: (...args: unknown[]) => getFixes(...args),
   startFixRun: (...args: unknown[]) => startFixRun(...args),
   decideFix: (...args: unknown[]) => decideFix(...args),
@@ -51,6 +64,23 @@ function callAction(body: Record<string, string>, url = "http://localhost/app/fi
     request: new Request(url, { method: "POST", body: form }),
   } as unknown as Parameters<typeof action>[0]) as Promise<Response>;
 }
+
+/** The action's non-redirect exit: a plain object rendered as a banner, never a thrown response. */
+type DecisionError = { error: { decision: string; status: number | null } };
+
+function callActionForData(body: Record<string, string>, url?: string) {
+  return callAction(body, url) as unknown as Promise<DecisionError>;
+}
+
+/**
+ * A real embedded-app URL. Shopify appends these one-time auth params to every page load, and
+ * `request.url` inside the action carries all of them — which is exactly why redirecting to
+ * `request.url` dead-ended the merchant on a raw `200` body.
+ */
+const EMBEDDED_URL =
+  "https://p01--quixly-app--x.code.run/app/fixes?embedded=1&hmac=abc123" +
+  "&host=YWRtaW4uc2hvcGlmeS5jb20&id_token=eyJhbGciOiJIUzI1NiJ9.payload.sig" +
+  "&locale=en&session=deadbeef&shop=fixes-shop.myshopify.com&timestamp=1754179200";
 
 beforeEach(() => {
   getFixes.mockReset();
@@ -190,5 +220,93 @@ describe("app.fixes action", () => {
     await callAction({ intent: "approve", fix_id: "8" });
 
     expect(startFixRun).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The approve/reject exit path.
+ *
+ * This is the branch that dead-ended the merchant on a blank page reading only "200": it
+ * redirected to `request.url`, which in an embedded app replays Shopify's one-time auth params
+ * and throws an `ErrorResponse` — and `boundary.error` renders an `ErrorResponse` as its raw
+ * body in a bare div, with no app chrome and no way back. The earlier tests above asserted only
+ * that `decideFix` was *called*, never what came back, which is how it shipped.
+ */
+describe("app.fixes action — the decision's exit path", () => {
+  beforeEach(() => {
+    decideFix.mockResolvedValue({ fix_id: 5, status: "approved" });
+  });
+
+  it("redirects approve to a RELATIVE /app/fixes, never an absolute URL", async () => {
+    const response = await callAction({ intent: "approve", fix_id: "5" }, EMBEDDED_URL);
+
+    expect(response.status).toBe(302);
+    const location = response.headers.get("location");
+    expect(location).toBe("/app/fixes");
+    expect(location?.startsWith("http")).toBe(false);
+  });
+
+  it("strips Shopify's one-time auth params from the redirect — the regression guard", async () => {
+    // Replaying id_token/hmac/session is what re-entered authenticate.admin with a spent token.
+    const response = await callAction({ intent: "approve", fix_id: "5" }, EMBEDDED_URL);
+
+    const location = response.headers.get("location") ?? "";
+    for (const param of ["id_token", "hmac", "session", "timestamp", "host", "embedded"]) {
+      expect(location).not.toContain(param);
+    }
+  });
+
+  it("keeps run_id and publish_run_id so the page stays scoped to the run under review", async () => {
+    const response = await callAction(
+      { intent: "approve", fix_id: "5" },
+      "http://localhost/app/fixes?run_id=42&publish_run_id=99",
+    );
+
+    expect(response.headers.get("location")).toBe("/app/fixes?run_id=42&publish_run_id=99");
+  });
+
+  it("ignores a non-numeric run_id rather than echoing it back into the URL", async () => {
+    const response = await callAction(
+      { intent: "approve", fix_id: "5" },
+      "http://localhost/app/fixes?run_id=not-a-number",
+    );
+
+    expect(response.headers.get("location")).toBe("/app/fixes");
+  });
+
+  it("redirects reject the same way", async () => {
+    decideFix.mockResolvedValue({ fix_id: 6, status: "rejected" });
+
+    const response = await callAction({ intent: "reject", fix_id: "6" }, EMBEDDED_URL);
+
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe("/app/fixes");
+  });
+
+  it("returns a 409 refusal as data — it never throws into the error boundary", async () => {
+    // Throwing here is what produced the raw-body dead end. The page must stay alive.
+    decideFix.mockRejectedValue(new AgentError(409, "/shops/by-domain/x/fixes/5/approve"));
+
+    const result = await callActionForData({ intent: "approve", fix_id: "5" }, EMBEDDED_URL);
+
+    expect(result).toEqual({ error: { decision: "approve", status: 409 } });
+  });
+
+  it("returns a transport failure as data with a null status", async () => {
+    decideFix.mockRejectedValue(new Error("ECONNREFUSED"));
+
+    const result = await callActionForData({ intent: "reject", fix_id: "6" });
+
+    expect(result).toEqual({ error: { decision: "reject", status: null } });
+  });
+
+  it("never leaks the agent's internal path to the merchant", async () => {
+    // The thrown message embeds /shops/by-domain/... — only the status may cross into the UI.
+    decideFix.mockRejectedValue(new AgentError(502, "/shops/by-domain/x/fixes/5/approve"));
+
+    const result = await callActionForData({ intent: "approve", fix_id: "5" });
+
+    expect(JSON.stringify(result)).not.toContain("by-domain");
+    expect(result.error.status).toBe(502);
   });
 });

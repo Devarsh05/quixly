@@ -276,7 +276,7 @@ export default function Uplift() {
         <s-section heading="Uplift">
           <s-banner tone="critical" heading="Couldn't reach the measurement service">
             <s-paragraph>
-              Your store is connected; this is a temporary problem reaching the Quixly agent. Try
+              Your store is connected; this is a temporary problem reaching the SixRise agent. Try
               again in a moment.
             </s-paragraph>
           </s-banner>
