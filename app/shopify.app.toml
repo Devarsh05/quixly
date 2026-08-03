@@ -1,7 +1,7 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "8ad730c2c915afc9e7dcae3ee071f7e0"
-name = "quixly"
+name = "SixRise"
 application_url = "https://p01--quixly-app--5x5p4hmrvgxk.code.run"
 embedded = true
 

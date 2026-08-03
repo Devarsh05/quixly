@@ -35,11 +35,11 @@ export default function Index() {
   }, [inProgress, revalidator]);
 
   return (
-    <s-page heading="Quixly">
+    <s-page heading="SixRise">
       <s-section heading="Catalog">
         {!agentReachable && (
           <s-paragraph>
-            Can&apos;t reach the Quixly agent service right now. Your store is connected;
+            Can&apos;t reach the SixRise agent service right now. Your store is connected;
             this page will recover once the agent is back.
           </s-paragraph>
         )}

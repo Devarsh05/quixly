@@ -18,11 +18,18 @@ import type {
   HeadersFunction,
   LoaderFunctionArgs,
 } from "react-router";
-import { Form, redirect, useLoaderData, useRevalidator } from "react-router";
+import {
+  Form,
+  redirect,
+  useActionData,
+  useLoaderData,
+  useRevalidator,
+} from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 
 import type { FixView, ProductFixes } from "../lib/agent.server";
 import {
+  AgentError,
   decideFix,
   getFixes,
   publishFixes,
@@ -33,6 +40,27 @@ import { authenticate } from "../shopify.server";
 function numericParam(url: URL, name: string): number | undefined {
   const raw = url.searchParams.get(name);
   return raw && /^\d+$/.test(raw) ? Number(raw) : undefined;
+}
+
+/**
+ * This page's own URL, rebuilt from scratch — carrying ONLY the two params the loader reads.
+ *
+ * **Never redirect to `request.url`.** In an embedded app that absolute URL also carries the
+ * one-time Shopify auth params (`id_token`, `hmac`, `session`, `timestamp`, `host`, `embedded`);
+ * redirecting back onto them re-enters `authenticate.admin` with a spent token, which throws an
+ * `ErrorResponse`. `boundary.error` renders an `ErrorResponse` as `error.data` in a bare
+ * `dangerouslySetInnerHTML` div — no app chrome, no nav — so the merchant dead-ends on a page
+ * showing the raw body. That is what this rebuild exists to prevent, and it is why the two
+ * branches below that already build an explicit relative path never had the bug.
+ */
+function fixesPath(request: Request): string {
+  const source = new URL(request.url).searchParams;
+  const params = new URLSearchParams();
+  for (const name of ["run_id", "publish_run_id"]) {
+    const value = source.get(name);
+    if (value && /^\d+$/.test(value)) params.set(name, value);
+  }
+  return params.size > 0 ? `/app/fixes?${params}` : "/app/fixes";
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -77,9 +105,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const fixId = Number(form.get("fix_id"));
   const decision = intent === "approve" ? "approve" : "reject";
-  await decideFix(session.shop, fixId, decision);
+
+  // A refusal must stay ON this page. Letting it throw would surface as an `ErrorResponse` in
+  // the app-level boundary, which renders the raw body with no chrome — a dead end for what is
+  // often a recoverable state (409 = someone already decided this fix).
+  try {
+    await decideFix(session.shop, fixId, decision);
+  } catch (error) {
+    return {
+      error: {
+        decision,
+        status: error instanceof AgentError ? error.status : null,
+      },
+    };
+  }
+
   // Re-read rather than mutating client state: the agent may have superseded sibling rows.
-  return redirect(request.url);
+  return redirect(fixesPath(request));
 };
 
 const POLL_INTERVAL_MS = 3000;
@@ -248,6 +290,35 @@ function SettledFix({ fix }: { fix: FixView }) {
   );
 }
 
+/**
+ * A decision the agent refused. Rendered as a banner ON the page — the list below it is still
+ * live and still current (React Router revalidates the loader after an action), so this is a
+ * recoverable state, not a dead end.
+ *
+ * The agent's own error message embeds the internal API path, so it is never shown; only the
+ * status is translated. 409 is the interesting one: the fix was already decided, or a sibling
+ * row superseded it, and the refreshed list below already reflects that.
+ */
+function DecisionError({ decision, status }: { decision: string; status: number | null }) {
+  const verb = decision === "approve" ? "approved" : "rejected";
+
+  return status === 409 ? (
+    <s-banner tone="warning" heading={`That change wasn't ${verb}`}>
+      <s-paragraph>
+        It had already been decided — either by you in another tab, or because approving a
+        different change for the same product replaced it. The list below is up to date.
+      </s-paragraph>
+    </s-banner>
+  ) : (
+    <s-banner tone="critical" heading={`That change wasn't ${verb}`}>
+      <s-paragraph>
+        We couldn&apos;t reach the fix service. Nothing was changed and nothing was sent to your
+        store — try again in a moment.
+      </s-paragraph>
+    </s-banner>
+  );
+}
+
 function ProductCard({ product }: { product: ProductFixes }) {
   const category = product.approvable.filter((f) => f.type === "category");
   const routine = product.approvable.filter((f) => f.type !== "category");
@@ -310,6 +381,7 @@ function ProductCard({ product }: { product: ProductFixes }) {
 
 export default function Fixes() {
   const { fixes, agentReachable } = useLoaderData<typeof loader>();
+  const actionData = useActionData<typeof action>();
   const revalidator = useRevalidator();
 
   const running = fixes?.status === "running";
@@ -329,12 +401,22 @@ export default function Fixes() {
 
   return (
     <s-page heading="Review fixes">
+      {/* 0. A refused approve/reject. Shown above everything, with the live list still below. */}
+      {actionData?.error && (
+        <s-section heading="Your last decision">
+          <DecisionError
+            decision={actionData.error.decision}
+            status={actionData.error.status}
+          />
+        </s-section>
+      )}
+
       {/* 1. Agent unreachable — distinct from "no fixes yet". */}
       {!agentReachable && (
         <s-section heading="Fixes">
           <s-banner tone="critical" heading="Couldn't reach the fix service">
             <s-paragraph>
-              Your store is connected; this is a temporary problem reaching the Quixly agent. Try
+              Your store is connected; this is a temporary problem reaching the SixRise agent. Try
               again in a moment.
             </s-paragraph>
           </s-banner>

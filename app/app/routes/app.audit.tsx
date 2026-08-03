@@ -118,7 +118,7 @@ export default function Audit() {
           <s-stack direction="block" gap="base">
             <s-banner tone="critical" heading="Couldn't reach the audit service">
               <s-paragraph>
-                Your store is connected; this is a temporary problem reaching the Quixly
+                Your store is connected; this is a temporary problem reaching the SixRise
                 agent. Try again in a moment.
               </s-paragraph>
             </s-banner>
